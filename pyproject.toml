@@ -1,0 +1,12 @@
+[project]
+name = "my-nano-vllm"
+version = "0.1.0"
+description = "A minimal Qwen3 model loader + inference engine, referencing nano-vllm."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "transformers",
+    "safetensors",
+    "tqdm",
+]
