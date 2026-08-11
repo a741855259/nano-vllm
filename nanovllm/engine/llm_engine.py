@@ -1,3 +1,6 @@
+from time import perf_counter
+
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from nanovllm.config import Config
@@ -29,7 +32,9 @@ class LLMEngine:
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
     ) -> list[dict]:
+        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
 
@@ -39,14 +44,30 @@ class LLMEngine:
                 prompt = self.tokenizer.encode(prompt)
             seqs.append(Sequence(prompt, sp))
 
-        results: dict[int, list[int]] = {}
+        outputs = {}
+        prefill_throughput = decode_throughput = 0.
         for seq in seqs:
             # Stateless generation: recompute over the full sequence each step
             # (no KV cache), sampling one token at a time until finished.
+            first_step = True
             while not self._finished(seq):
+                t = perf_counter()
                 token_id = self.model_runner.run(seq)
                 seq.append_token(token_id)
-            results[seq.seq_id] = seq.completion_token_ids
+                num_tokens = len(seq.prompt_token_ids) if first_step else -1
+                if num_tokens > 0:
+                    prefill_throughput = num_tokens / (perf_counter() - t)
+                else:
+                    decode_throughput = -num_tokens / (perf_counter() - t)
+                first_step = False
+                pbar.set_postfix({
+                    "Prefill": f"{int(prefill_throughput)}tok/s",
+                    "Decode": f"{int(decode_throughput)}tok/s",
+                })
+            outputs[seq.seq_id] = seq.completion_token_ids
+            pbar.update(1)
+        pbar.close()
 
-        ordered = [results[seq.seq_id] for seq in seqs]
-        return [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in ordered]
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        return outputs
