@@ -2,25 +2,17 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-# Single-GPU only (tensor-parallel size is fixed at 1). The parallel naming and
-# the packed/merged weight loaders are kept so the model mirrors nano-vllm and so
-# q/k/v (and gate/up) can be fused into single projections.
-TP_SIZE = 1
-TP_RANK = 0
-
-
-def divide(numerator, denominator):
-    assert numerator % denominator == 0
-    return numerator // denominator
+# Single-GPU only -- no tensor parallelism. The "Parallel" naming is inherited
+# from nano-vllm/vLLM (where these classes shard across TP ranks); here they are
+# plain linears. What remains meaningful is the *weight fusion*: q/k/v are fused
+# into a single qkv_proj and gate/up into a single gate_up_proj, so each is one
+# matmul, and the weight_loader places the sub-weights at offsets (not sharding).
 
 
 class LinearBase(nn.Module):
 
-    def __init__(self, input_size: int, output_size: int, bias: bool = False, tp_dim: int | None = None):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False):
         super().__init__()
-        self.tp_dim = tp_dim
-        self.tp_rank = TP_RANK
-        self.tp_size = TP_SIZE
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -36,56 +28,43 @@ class LinearBase(nn.Module):
         raise NotImplementedError
 
 
-class ReplicatedLinear(LinearBase):
-    # kept for parity; behaves like a plain Linear without bias by default
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
-
-
 class ColumnParallelLinear(LinearBase):
+    # Single-GPU: a plain linear. Base class for the fused projections below.
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
-        super().__init__(input_size, divide(output_size, TP_SIZE), bias, 0)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param_data = param.data
-        shard_size = param_data.size(self.tp_dim)
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        super().__init__(input_size, output_size, bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
+    # Fuses two same-input projections (gate, up) into one weight, placing each
+    # at an offset along the output dim. One fused matmul, not tensor parallelism.
 
     def __init__(self, input_size: int, output_sizes: list[int], bias: bool = False):
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
-        param_data = param.data
-        shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-        shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
-        param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
-        param_data.copy_(loaded_weight)
+        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+        shard_size = self.output_sizes[loaded_shard_id]
+        param.data.narrow(0, shard_offset, shard_size).copy_(loaded_weight)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
+    # Fuses q, k, v projections into one weight: q at offset 0, k after q, v after k.
 
-    def __init__(self, hidden_size: int, head_size: int, total_num_heads: int,
-                 total_num_kv_heads: int | None = None, bias: bool = False):
-        total_num_kv_heads = total_num_kv_heads or total_num_heads
+    def __init__(self, hidden_size: int, head_size: int, num_heads: int,
+                 num_kv_heads: int | None = None, bias: bool = False):
+        num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
-        self.num_heads = divide(total_num_heads, TP_SIZE)
-        self.num_kv_heads = divide(total_num_kv_heads, TP_SIZE)
-        output_size = (total_num_heads + 2 * total_num_kv_heads) * head_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        output_size = (num_heads + 2 * num_kv_heads) * head_size
         super().__init__(hidden_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
-        param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":
             shard_size = self.num_heads * self.head_size
@@ -96,25 +75,14 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
-        param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
-        param_data.copy_(loaded_weight)
+        param.data.narrow(0, shard_offset, shard_size).copy_(loaded_weight)
 
 
 class RowParallelLinear(LinearBase):
+    # Single-GPU: a plain linear (no input-dim sharding, no all-reduce).
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
-        super().__init__(divide(input_size, TP_SIZE), output_size, bias, 1)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param_data = param.data
-        if param_data.ndim == 1:
-            param_data.copy_(loaded_weight)
-            return
-        shard_size = param_data.size(self.tp_dim)
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        super().__init__(input_size, output_size, bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)

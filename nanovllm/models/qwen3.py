@@ -27,21 +27,18 @@ class Qwen3Attention(nn.Module):
     def __init__(self, hidden_size, num_heads, num_kv_heads, max_position=4096 * 32,
                  head_dim=None, rms_norm_eps=1e-06, qkv_bias=False, rope_theta=10000, rope_scaling=None):
         super().__init__()
-        self.total_num_heads = num_heads
-        self.total_num_kv_heads = num_kv_heads
-        # Single-GPU (tp_size == 1)
-        self.num_heads = self.total_num_heads
-        self.num_kv_heads = self.total_num_kv_heads
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim or hidden_size // self.num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
-            hidden_size, self.head_dim, self.total_num_heads, self.total_num_kv_heads, bias=qkv_bias,
+            hidden_size, self.head_dim, self.num_heads, self.num_kv_heads, bias=qkv_bias,
         )
-        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim, hidden_size, bias=False)
+        self.o_proj = RowParallelLinear(self.num_heads * self.head_dim, hidden_size, bias=False)
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(self.head_dim, rotary_dim=self.head_dim,
