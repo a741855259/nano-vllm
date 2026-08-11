@@ -23,6 +23,7 @@ def main():
 
     # --- HF reference ---
     hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).cuda().eval()
+    print(hf_model)
     with torch.inference_mode():
         hf_logits = hf_model(input_ids).logits[0, -1]
     hf_token = hf_logits.argmax(dim=-1).item()
