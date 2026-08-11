@@ -28,13 +28,12 @@ def main():
     hf_token = hf_logits.argmax(dim=-1).item()
     hf_top = torch.topk(hf_logits.float(), 5).indices.tolist()
 
-    # --- our engine (greedy, single prefill step) ---
+    # --- our engine (greedy, single forward over the prompt) ---
     llm = LLM(model_path, max_model_len=4096)
-    llm.model_runner.reset_kv_cache()
     from nanovllm.engine.sequence import Sequence
     from nanovllm.sampling_params import SamplingParams
     seq = Sequence(input_ids[0].tolist(), SamplingParams(temperature=0.0, max_tokens=1))
-    our_token = llm.model_runner.run(seq, is_prefill=True)
+    our_token = llm.model_runner.run(seq)
 
     print(f"prompt tokens : {input_ids.numel()}")
     print(f"HF  argmax id : {hf_token}  ({tokenizer.decode([hf_token])!r})")

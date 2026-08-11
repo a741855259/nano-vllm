@@ -41,13 +41,10 @@ class LLMEngine:
 
         results: dict[int, list[int]] = {}
         for seq in seqs:
-            self.model_runner.reset_kv_cache()
-            # prefill -> first generated token
-            token_id = self.model_runner.run(seq, is_prefill=True)
-            seq.append_token(token_id)
-            # decode loop
+            # Stateless generation: recompute over the full sequence each step
+            # (no KV cache), sampling one token at a time until finished.
             while not self._finished(seq):
-                token_id = self.model_runner.run(seq, is_prefill=False)
+                token_id = self.model_runner.run(seq)
                 seq.append_token(token_id)
             results[seq.seq_id] = seq.completion_token_ids
 

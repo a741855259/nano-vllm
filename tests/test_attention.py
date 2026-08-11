@@ -1,38 +1,30 @@
-"""Unit tests for the SDPA append-and-attend attention. Run: python tests/test_attention.py"""
+"""Unit tests for the stateless GQA attention. Run: python tests/test_attention.py"""
 import torch
+import torch.nn.functional as F
 
 from nanovllm.layers.attention import Attention
 
 
 def make_attn():
     # GQA: 4 q heads, 2 kv heads, head_dim 8
-    attn = Attention(num_heads=4, head_dim=8, scale=8 ** -0.5, num_kv_heads=2)
-    return attn
+    return Attention(num_heads=4, head_dim=8, scale=8 ** -0.5, num_kv_heads=2)
 
 
-def _run(attn, n):
-    torch.manual_seed(0)
-    q = torch.randn(n, 4, 8)
-    k = torch.randn(n, 2, 8)
-    v = torch.randn(n, 2, 8)
-    return attn(q, k, v)
-
-
-def test_output_shape_and_cache_growth():
+def test_output_shape():
     attn = make_attn()
-    o = _run(attn, 5)  # prefill
+    torch.manual_seed(0)
+    q = torch.randn(5, 4, 8)
+    k = torch.randn(5, 2, 8)
+    v = torch.randn(5, 2, 8)
+    o = attn(q, k, v)
     assert o.shape == (5, 4 * 8), o.shape
-    assert attn.k_cache.shape == (5, 2, 8), attn.k_cache.shape
-    # decode step
-    o1 = _run(attn, 1)
-    assert o1.shape == (1, 4 * 8), o1.shape
-    assert attn.k_cache.shape == (6, 2, 8), attn.k_cache.shape
-    print("  shapes / cache growth: OK")
+    print("  output shape: OK")
 
 
 def test_causal_masking():
-    # In prefill, query at position i must not attend to keys at positions > i.
-    # Changing a future key (position > i) leaves output[i] unchanged.
+    # With is_causal=True, query at position i must not attend to keys at j > i.
+    # Mutating a FUTURE key leaves outputs for earlier positions unchanged, while
+    # the last position's output (which sees that key) does change.
     attn = make_attn()
     torch.manual_seed(1)
     n = 6
@@ -41,10 +33,8 @@ def test_causal_masking():
     v = torch.randn(n, 2, 8)
     o_ref = attn(q, k, v)
 
-    # mutate the LAST key only; outputs for positions 0..n-2 must be identical
     k2 = k.clone()
     k2[-1] = torch.randn(2, 8) * 10.0
-    attn.k_cache = None
     o_mut = attn(q, k2, v)
 
     diff_early = (o_ref[:n - 1] - o_mut[:n - 1]).abs().max().item()
@@ -54,46 +44,45 @@ def test_causal_masking():
     print("  causal masking: OK")
 
 
-def test_decode_matches_prefill_last_row():
-    # The decode output for the newest token must equal the last row of a full
-    # prefill over the same (L+1) tokens: the new query sits at the last position
-    # and attends to ALL cached keys. This is the regression test for the
-    # is_causal upper-left-alignment bug (decode must NOT mask out older keys).
+def test_gqa_matches_manual():
+    # The repeat_interleave grouping must match a manual GQA reference.
+    attn = make_attn()
+    torch.manual_seed(3)
+    n = 4
+    q = torch.randn(n, 4, 8)
+    k = torch.randn(n, 2, 8)
+    v = torch.randn(n, 2, 8)
+    o = attn(q, k, v)  # [n, 32]
+
+    kr = k.repeat_interleave(2, dim=1)   # [n, 4, 8]: heads [kv0,kv0,kv1,kv1]
+    vr = v.repeat_interleave(2, dim=1)
+    ref = F.scaled_dot_product_attention(
+        q.transpose(0, 1).unsqueeze(0), kr.transpose(0, 1).unsqueeze(0),
+        vr.transpose(0, 1).unsqueeze(0), scale=8 ** -0.5, is_causal=True,
+    ).transpose(1, 2).reshape(n, 32)
+    assert torch.allclose(o, ref, atol=1e-5), "GQA repeat grouping mismatch"
+    print("  GQA grouping: OK")
+
+
+def test_stateless():
+    # No carried state: the same input always yields the same output, and
+    # calling repeatedly does not accumulate anything.
     attn = make_attn()
     torch.manual_seed(2)
-    L = 5
-    q = torch.randn(L, 4, 8); k = torch.randn(L, 2, 8); v = torch.randn(L, 2, 8)
-    attn(q, k, v)  # prefill L tokens, fills cache
-    q1 = torch.randn(1, 4, 8); k1 = torch.randn(1, 2, 8); v1 = torch.randn(1, 2, 8)
-    o_decode = attn(q1, k1, v1)                       # [1, 32]
-
-    attn2 = make_attn()
-    qf = torch.cat([q, q1]); kf = torch.cat([k, k1]); vf = torch.cat([v, v1])
-    o_full = attn2(qf, kf, vf)                        # [L+1, 32]
-    assert torch.allclose(o_decode, o_full[-1:], atol=1e-5), \
-        f"decode != prefill last row: max diff {(o_decode - o_full[-1:]).abs().max()}"
-    print("  decode == prefill-last-row: OK")
-
-
-def test_reset():
-    attn = make_attn()
-    _run(attn, 3)
-    assert attn.k_cache is not None
-    attn.k_cache = None
-    attn.v_cache = None
-    assert attn.k_cache is None
-    # first forward after reset replaces instead of concatenating
-    o = _run(attn, 2)
-    assert attn.k_cache.shape == (2, 2, 8), attn.k_cache.shape
-    print("  reset: OK")
+    q = torch.randn(3, 4, 8); k = torch.randn(3, 2, 8); v = torch.randn(3, 2, 8)
+    o1 = attn(q, k, v)
+    o2 = attn(q, k, v)
+    assert torch.allclose(o1, o2), "attention is not stateless"
+    assert not any(hasattr(attn, attr) for attr in ("k_cache", "v_cache")), "leftover cache state"
+    print("  stateless: OK")
 
 
 def main():
     print("Running attention unit tests...")
-    test_output_shape_and_cache_growth()
+    test_output_shape()
     test_causal_masking()
-    test_decode_matches_prefill_last_row()
-    test_reset()
+    test_gqa_matches_manual()
+    test_stateless()
     print("All attention tests passed.")
 
 

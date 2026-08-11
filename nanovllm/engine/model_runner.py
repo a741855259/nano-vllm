@@ -9,8 +9,8 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
     """Builds the model on GPU (bf16), loads safetensors weights, and runs
-    single-sequence prefill / decode. No tensor-parallel, no CUDA graphs, no
-    continuous batching."""
+    single-sequence generation. No KV cache, no tensor-parallel, no CUDA graphs,
+    no continuous batching."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -25,22 +25,11 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-    def reset_kv_cache(self):
-        for module in self.model.modules():
-            if hasattr(module, "k_cache"):
-                module.k_cache = None
-                module.v_cache = None
-
     @torch.inference_mode()
-    def run(self, seq: Sequence, is_prefill: bool) -> int:
-        if is_prefill:
-            ids = seq.prompt_token_ids
-            input_ids = torch.tensor(ids, dtype=torch.int64, device="cuda")
-            positions = torch.arange(len(ids), dtype=torch.int64, device="cuda")
-        else:
-            input_ids = torch.tensor([seq.last_token], dtype=torch.int64, device="cuda")
-            positions = torch.tensor([len(seq) - 1], dtype=torch.int64, device="cuda")
-
+    def run(self, seq: Sequence) -> int:
+        # Stateless: recompute over the full sequence on every step (no KV cache).
+        input_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
+        positions = torch.arange(len(seq), dtype=torch.int64, device="cuda")
         hidden_states = self.model(input_ids, positions)
         logits = self.model.compute_logits(hidden_states[-1:].contiguous())
         token_id = self.sampler(logits, seq.temperature)

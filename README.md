@@ -12,9 +12,11 @@ chat template.
 
 ## Design
 
-- **Attention:** `F.scaled_dot_product_attention` with a per-sequence,
-  append-and-attend KV cache. `is_causal=True` only on prefill (`q_len == kv_len`);
-  decode (single query at the last position) uses full attention.
+- **Attention:** `F.scaled_dot_product_attention`, **stateless — no KV cache**.
+  The runner feeds the full token sequence on every step and recomputes
+  attention over all of it (so `is_causal=True` always, `q_len == kv_len`).
+  Simplest possible form: no paged cache, no carried state, no prefill/decode
+  split. Trades speed (O(n²) per generation) for clarity.
 - **Layout:** mirrors `nano-vllm/nanovllm/` (`engine/`, `layers/`, `models/`,
   `utils/`), dropping the optimization-only files (`block_manager`, `scheduler`,
   `context`).
