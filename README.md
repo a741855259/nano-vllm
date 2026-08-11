@@ -4,19 +4,18 @@ A minimal Qwen3 model-structure loader + inference engine, referencing
 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
 
 It loads Qwen3 weights from safetensors and runs greedy / temperature-sampled
-generation on GPU — **without** any of nano-vllm's inference optimizations
-(paged KV cache, prefix caching, continuous batching, tensor parallelism, CUDA
-graphs, `torch.compile`, flash_attn, triton). The model itself is implemented
-from scratch; `transformers` is used only for the tokenizer, the config, and the
-chat template.
+generation on GPU. It includes a minimal contiguous KV cache, but none of
+nano-vllm's other inference optimizations (paged/prefix caching, continuous
+batching, tensor parallelism, CUDA graphs, `torch.compile`, flash_attn, triton).
+The model itself is implemented from scratch; `transformers` is used only for
+the tokenizer, the config, and the chat template.
 
 ## Design
 
-- **Attention:** `F.scaled_dot_product_attention`, **stateless — no KV cache**.
-  The runner feeds the full token sequence on every step and recomputes
-  attention over all of it (so `is_causal=True` always, `q_len == kv_len`).
-  Simplest possible form: no paged cache, no carried state, no prefill/decode
-  split. Trades speed (O(n²) per generation) for clarity.
+- **Attention:** `F.scaled_dot_product_attention` with a per-layer, contiguous
+  KV cache. The first step prefills the complete prompt; every decode step
+  inputs only the newest token. There is no paged allocation or cross-request
+  cache sharing.
 - **Layout:** mirrors `nano-vllm/nanovllm/` (`engine/`, `layers/`, `models/`,
   `utils/`), dropping the optimization-only files (`block_manager`, `scheduler`,
   `context`).

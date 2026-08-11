@@ -47,8 +47,8 @@ class LLMEngine:
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         for seq in seqs:
-            # Stateless generation: recompute over the full sequence each step
-            # (no KV cache), sampling one token at a time until finished.
+            # Requests are still serial, but decode inputs only the newest token
+            # and reuses the sequence's per-layer KV cache.
             first_step = True
             while not self._finished(seq):
                 t = perf_counter()
@@ -65,6 +65,7 @@ class LLMEngine:
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
             outputs[seq.seq_id] = seq.completion_token_ids
+            self.model_runner.reset_cache()
             pbar.update(1)
         pbar.close()
 
