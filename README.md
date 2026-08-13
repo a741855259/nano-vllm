@@ -4,21 +4,23 @@ A minimal Qwen3 model-structure loader + inference engine, referencing
 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
 
 It loads Qwen3 weights from safetensors and runs greedy / temperature-sampled
-generation on GPU. It includes a minimal contiguous KV cache, but none of
-nano-vllm's other inference optimizations (paged/prefix caching, continuous
-batching, tensor parallelism, CUDA graphs, `torch.compile`, flash_attn, triton).
+generation on GPU. It includes a minimal paged KV cache, but none of nano-vllm's
+other inference optimizations (prefix caching, continuous batching, tensor
+parallelism, CUDA graphs, `torch.compile`, flash_attn, triton).
 The model itself is implemented from scratch; `transformers` is used only for
 the tokenizer, the config, and the chat template.
 
 ## Design
 
-- **Attention:** `F.scaled_dot_product_attention` with a per-layer, contiguous
-  KV cache. The first step prefills the complete prompt; every decode step
-  inputs only the newest token. There is no paged allocation or cross-request
-  cache sharing.
+- **Attention:** `F.scaled_dot_product_attention` with a preallocated, per-layer
+  paged KV cache. `ModelRunner` owns one unified cache tensor and binds each
+  attention layer to a view. A block table maps logical token positions to
+  reusable physical blocks. Since SDPA cannot consume that table directly, K/V
+  pages are gathered into logical order before attention. There is no prefix
+  sharing.
 - **Layout:** mirrors `nano-vllm/nanovllm/` (`engine/`, `layers/`, `models/`,
-  `utils/`), dropping the optimization-only files (`block_manager`, `scheduler`,
-  `context`).
+  `utils/`). `block_manager` and `context` support paged caching; the continuous
+  batching `scheduler` remains intentionally omitted.
 - Single GPU, `tp_size == 1` (all `torch.distributed` machinery removed).
 
 See `docs/superpowers/specs/` for the full design and `docs/superpowers/plans/`

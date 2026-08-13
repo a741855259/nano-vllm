@@ -4,8 +4,7 @@ from nanovllm.sampling_params import SamplingParams
 
 
 class Sequence:
-    """A single generation request. Trimmed from nano-vllm: no block table,
-    no caching/prefill bookkeeping, no pickle machinery (single-process)."""
+    """A single generation request and its logical-to-physical KV block table."""
 
     counter = count()
 
@@ -14,6 +13,8 @@ class Sequence:
         self.token_ids = list(token_ids)
         self.prompt_token_ids = list(token_ids)
         self.last_token = token_ids[-1]
+        self.block_table: list[int] = []
+        self.num_cached_tokens = 0
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
