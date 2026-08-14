@@ -1,7 +1,6 @@
 import torch
 
 from nanovllm.config import Config
-from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.attention import Attention
@@ -12,7 +11,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
     """Builds the model on GPU (bf16), loads safetensors weights, and runs
-    single-sequence generation with a minimal paged KV cache."""
+    batches of sequences with a minimal paged KV cache."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -25,9 +24,7 @@ class ModelRunner:
         self.model.eval()
         self.sampler = Sampler()
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks)
         self.allocate_kv_cache()
-        self.active_seq: Sequence | None = None
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -55,53 +52,80 @@ class ModelRunner:
             attention.k_cache = self.kv_cache[0, layer_id]
             attention.v_cache = self.kv_cache[1, layer_id]
 
-    def reset_cache(self):
-        if self.active_seq is not None:
-            self.block_manager.deallocate(self.active_seq)
-        self.active_seq = None
-        reset_context()
+    def _prepare_batch(self, seqs: list[Sequence], is_prefill: bool):
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        query_lens = []
+        context_lens = []
+        for seq in seqs:
+            required_blocks = (len(seq) + self.block_size - 1) // self.block_size
+            assert len(seq.block_table) >= required_blocks, (
+                "scheduler did not allocate enough KV-cache blocks"
+            )
+            if is_prefill:
+                assert seq.num_cached_tokens == 0
+                seq_input_ids = seq.token_ids
+                seq_positions = list(range(len(seq)))
+            else:
+                assert seq.num_cached_tokens == len(seq) - 1, (
+                    f"KV cache has {seq.num_cached_tokens} tokens, expected {len(seq) - 1}"
+                )
+                seq_input_ids = [seq.last_token]
+                seq_positions = [len(seq) - 1]
 
-    def _ensure_blocks(self, seq: Sequence):
-        num_blocks = (len(seq) + self.block_size - 1) // self.block_size
-        self.block_manager.ensure_capacity(seq, num_blocks)
+            input_ids.extend(seq_input_ids)
+            positions.extend(seq_positions)
+            query_lens.append(len(seq_input_ids))
+            context_lens.append(len(seq))
+            slot_mapping.extend(
+                seq.block_table[position // self.block_size] * self.block_size
+                + position % self.block_size
+                for position in seq_positions
+            )
 
-    def _slot_mapping(
-        self, positions: torch.Tensor, seq: Sequence,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        block_table = torch.tensor(seq.block_table, dtype=torch.int64, device="cuda")
-        logical_blocks = torch.div(positions, self.block_size, rounding_mode="floor")
-        slots = block_table[logical_blocks] * self.block_size + positions.remainder(self.block_size)
-        return slots, block_table
+        max_num_blocks = max(len(seq.block_table) for seq in seqs)
+        block_tables = [
+            seq.block_table + [0] * (max_num_blocks - len(seq.block_table))
+            for seq in seqs
+        ]
+        cu_seqlens_q = [0]
+        for query_len in query_lens:
+            cu_seqlens_q.append(cu_seqlens_q[-1] + query_len)
+
+        device = self.kv_cache.device
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
+        positions = torch.tensor(positions, dtype=torch.int64, device=device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, device=device)
+        block_tables = torch.tensor(block_tables, dtype=torch.int64, device=device)
+        context_lens_tensor = torch.tensor(context_lens, dtype=torch.int64, device=device)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int64, device=device)
+        set_context(
+            is_prefill,
+            slot_mapping,
+            block_tables,
+            context_lens_tensor,
+            cu_seqlens_q,
+            max(query_lens),
+            max(context_lens),
+            self.block_size,
+        )
+        return input_ids, positions, cu_seqlens_q
 
     @torch.inference_mode()
-    def run(self, seq: Sequence) -> int:
-        if self.active_seq is not seq:
-            self.reset_cache()
-            self.active_seq = seq
-
-        is_prefill = not seq.block_table
-        if is_prefill:
-            input_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
-            positions = torch.arange(len(seq), dtype=torch.int64, device="cuda")
-        else:
-            # The token sampled after the previous call is the only token not
-            # yet represented in the cache.
-            assert seq.num_cached_tokens == len(seq) - 1, (
-                f"KV cache has {seq.num_cached_tokens} tokens, expected {len(seq) - 1}"
-            )
-            input_ids = torch.tensor([seq.last_token], dtype=torch.int64, device="cuda")
-            positions = torch.tensor([len(seq) - 1], dtype=torch.int64, device="cuda")
-
-        self._ensure_blocks(seq)
-        slot_mapping, block_table = self._slot_mapping(positions, seq)
-        set_context(is_prefill, slot_mapping, block_table, len(seq), self.block_size)
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """Run one packed prefill or decode batch in a single model forward."""
+        assert seqs, "seqs must not be empty"
+        input_ids, positions, cu_seqlens_q = self._prepare_batch(seqs, is_prefill)
         try:
             hidden_states = self.model(input_ids, positions)
         finally:
             reset_context()
-        seq.num_cached_tokens = len(seq)
-        # Prefill returns one hidden state per prompt token; only the final one
-        # is sampled. Decode already has length one, so this works for both.
-        logits = self.model.compute_logits(hidden_states[-1:].contiguous())
-        token_id = self.sampler(logits, seq.temperature)
-        return token_id.item()
+
+        if is_prefill:
+            hidden_states = hidden_states[cu_seqlens_q[1:] - 1]
+        logits = self.model.compute_logits(hidden_states.contiguous())
+        temperatures = torch.tensor(
+            [seq.temperature for seq in seqs], dtype=torch.float32, device=self.kv_cache.device,
+        )
+        return self.sampler(logits, temperatures).tolist()

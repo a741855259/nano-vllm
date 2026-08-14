@@ -1,6 +1,13 @@
+from enum import Enum, auto
 from itertools import count
 
 from nanovllm.sampling_params import SamplingParams
+
+
+class SequenceStatus(Enum):
+    WAITING = auto()
+    RUNNING = auto()
+    FINISHED = auto()
 
 
 class Sequence:
@@ -10,6 +17,7 @@ class Sequence:
 
     def __init__(self, token_ids: list[int], sampling_params: SamplingParams = SamplingParams()):
         self.seq_id = next(Sequence.counter)
+        self.status = SequenceStatus.WAITING
         self.token_ids = list(token_ids)
         self.prompt_token_ids = list(token_ids)
         self.last_token = token_ids[-1]
@@ -21,6 +29,10 @@ class Sequence:
 
     def __len__(self):
         return len(self.token_ids)
+
+    @property
+    def is_finished(self):
+        return self.status == SequenceStatus.FINISHED
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)

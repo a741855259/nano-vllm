@@ -34,7 +34,7 @@ def main():
     from nanovllm.engine.sequence import Sequence
     from nanovllm.sampling_params import SamplingParams
     seq = Sequence(input_ids[0].tolist(), SamplingParams(temperature=0.0, max_tokens=1))
-    our_token = llm.model_runner.run(seq)
+    our_token = llm.model_runner.run([seq], is_prefill=True)[0]
 
     print(f"prompt tokens : {input_ids.numel()}")
     print(f"HF  argmax id : {hf_token}  ({tokenizer.decode([hf_token])!r})")

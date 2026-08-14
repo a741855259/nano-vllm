@@ -20,11 +20,13 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         assert self.k_cache is not None and self.v_cache is not None
-        assert context.slot_mapping is not None and context.block_table is not None
+        assert context.slot_mapping is not None
+        assert context.block_tables is not None and context.context_lens is not None
+        assert context.cu_seqlens_q is not None
 
         # Write new K/V into physical cache slots selected by the block table.
-        q_len = q.size(0)
-        assert context.slot_mapping.numel() == q_len
+        num_tokens = q.size(0)
+        assert context.slot_mapping.numel() == num_tokens
         flat_k_cache = self.k_cache.flatten(0, 1)
         flat_v_cache = self.v_cache.flatten(0, 1)
         flat_k_cache.index_copy_(0, context.slot_mapping, k)
@@ -33,19 +35,22 @@ class Attention(nn.Module):
         # SDPA does not consume a block table directly, so gather the logical
         # sequence from physical pages before attention. A paged kernel can
         # replace this gather later without changing allocation or scheduling.
-        logical_positions = torch.arange(context.context_len, device=q.device)
+        batch_size = context.context_lens.numel()
+        logical_positions = torch.arange(context.max_seqlen_k, device=q.device)
         logical_blocks = torch.div(logical_positions, context.block_size, rounding_mode="floor")
+        block_ids = context.block_tables[:, logical_blocks]
+        valid_keys = logical_positions.unsqueeze(0) < context.context_lens.unsqueeze(1)
         physical_slots = (
-            context.block_table[logical_blocks] * context.block_size
-            + logical_positions.remainder(context.block_size)
+            block_ids * context.block_size + logical_positions.remainder(context.block_size)
         )
+        physical_slots = physical_slots.masked_fill(~valid_keys, 0)
         k = flat_k_cache[physical_slots]
         v = flat_v_cache[physical_slots]
 
-        # SDPA expects [batch, heads, seq, dim].
-        q_ = q.transpose(0, 1).unsqueeze(0)                          # [1, H, N, D]
-        k_ = k.transpose(0, 1).unsqueeze(0)                          # [1, kvH, N, D]
-        v_ = v.transpose(0, 1).unsqueeze(0)                          # [1, kvH, N, D]
+        # SDPA expects [batch, heads, seq, dim]. K/V are gathered from each
+        # sequence's page table into a padded batch.
+        k_ = k.transpose(1, 2)
+        v_ = v.transpose(1, 2)
 
         # Repeat kv heads for GQA (each kv head serves num_heads // num_kv_heads q heads).
         rep = self.num_heads // self.num_kv_heads
@@ -53,10 +58,40 @@ class Attention(nn.Module):
             k_ = k_.repeat_interleave(rep, dim=1)
             v_ = v_.repeat_interleave(rep, dim=1)
 
-        # During decode q_len == 1 and the query is the final sequence position,
-        # so an SDPA causal mask would incorrectly let it see only key 0.
+        if context.is_prefill:
+            query_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
+            seq_ids = torch.repeat_interleave(
+                torch.arange(batch_size, device=q.device), query_lens,
+            )
+            query_offsets = (
+                torch.arange(num_tokens, device=q.device)
+                - torch.repeat_interleave(context.cu_seqlens_q[:-1], query_lens)
+            )
+            q_padded = q.new_zeros(
+                batch_size, context.max_seqlen_q, self.num_heads, self.head_dim,
+            )
+            q_padded[seq_ids, query_offsets] = q
+            q_ = q_padded.transpose(1, 2)
+
+            query_positions = torch.arange(context.max_seqlen_q, device=q.device)
+            valid_queries = query_positions.unsqueeze(0) < query_lens.unsqueeze(1)
+            causal = logical_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+            attn_mask = (
+                valid_queries[:, None, :, None]
+                & valid_keys[:, None, None, :]
+                & causal[None, None, :, :]
+            )
+        else:
+            assert num_tokens == batch_size
+            q_ = q.unsqueeze(2)
+            attn_mask = valid_keys[:, None, None, :]
+
         o = F.scaled_dot_product_attention(
-            q_, k_, v_, scale=self.scale, is_causal=context.is_prefill,
+            q_, k_, v_, attn_mask=attn_mask, scale=self.scale,
         )
-        o = o.transpose(1, 2).reshape(q_len, self.num_heads * self.head_dim)
-        return o
+        o = o.transpose(1, 2)
+        if context.is_prefill:
+            o = o[seq_ids, query_offsets]
+        else:
+            o = o.squeeze(1)
+        return o.reshape(num_tokens, self.num_heads * self.head_dim)

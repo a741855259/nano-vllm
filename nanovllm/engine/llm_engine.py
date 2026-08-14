@@ -7,6 +7,7 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.scheduler import Scheduler
 
 
 class LLMEngine:
@@ -18,15 +19,26 @@ class LLMEngine:
         self.model_runner = ModelRunner(self.config)
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.model, use_fast=True)
         self.config.eos = self.tokenizer.eos_token_id
+        self.scheduler = Scheduler(self.config)
 
-    def _finished(self, seq: Sequence) -> bool:
-        if seq.num_completion_tokens >= seq.max_tokens:
-            return True
-        if len(seq) >= self.config.max_model_len:
-            return True
-        if not seq.ignore_eos and seq.last_token == self.config.eos:
-            return True
-        return False
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        if isinstance(prompt, str):
+            prompt = self.tokenizer.encode(prompt)
+        self.scheduler.add(Sequence(prompt, sampling_params))
+
+    def step(self):
+        seqs, is_prefill = self.scheduler.schedule()
+        num_tokens = sum(len(seq.prompt_token_ids) for seq in seqs) if is_prefill else -len(seqs)
+        if seqs:
+            token_ids = self.model_runner.run(seqs, is_prefill)
+            self.scheduler.postprocess(seqs, token_ids)
+        finished = self.scheduler.pop_finished()
+        assert seqs or finished, "step called with no scheduled sequences"
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        return outputs, num_tokens
+
+    def is_finished(self):
+        return self.scheduler.is_finished()
 
     def generate(
         self,
@@ -38,35 +50,25 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
 
-        seqs = []
         for prompt, sp in zip(prompts, sampling_params):
-            if isinstance(prompt, str):
-                prompt = self.tokenizer.encode(prompt)
-            seqs.append(Sequence(prompt, sp))
+            self.add_request(prompt, sp)
 
         outputs = {}
         prefill_throughput = decode_throughput = 0.
-        for seq in seqs:
-            # Requests are still serial, but decode inputs only the newest token
-            # and reuses the sequence's per-layer KV cache.
-            first_step = True
-            while not self._finished(seq):
-                t = perf_counter()
-                token_id = self.model_runner.run(seq)
-                seq.append_token(token_id)
-                num_tokens = len(seq.prompt_token_ids) if first_step else -1
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                first_step = False
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
-            outputs[seq.seq_id] = seq.completion_token_ids
-            self.model_runner.reset_cache()
-            pbar.update(1)
+        while not self.is_finished():
+            t = perf_counter()
+            output, num_tokens = self.step()
+            if num_tokens > 0:
+                prefill_throughput = num_tokens / (perf_counter() - t)
+            else:
+                decode_throughput = -num_tokens / (perf_counter() - t)
+            pbar.set_postfix({
+                "Prefill": f"{int(prefill_throughput)}tok/s",
+                "Decode": f"{int(decode_throughput)}tok/s",
+            })
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
+                pbar.update(1)
         pbar.close()
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]

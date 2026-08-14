@@ -4,9 +4,10 @@ A minimal Qwen3 model-structure loader + inference engine, referencing
 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
 
 It loads Qwen3 weights from safetensors and runs greedy / temperature-sampled
-generation on GPU. It includes a minimal paged KV cache, but none of nano-vllm's
-other inference optimizations (prefix caching, continuous batching, tensor
-parallelism, CUDA graphs, `torch.compile`, flash_attn, triton).
+generation on GPU. It includes a minimal paged KV cache and request scheduler,
+plus packed prefill and batched decode. It does not include nano-vllm's other
+inference optimizations (prefix caching, tensor parallelism, CUDA graphs,
+`torch.compile`, flash_attn, triton).
 The model itself is implemented from scratch; `transformers` is used only for
 the tokenizer, the config, and the chat template.
 
@@ -16,11 +17,13 @@ the tokenizer, the config, and the chat template.
   paged KV cache. `ModelRunner` owns one unified cache tensor and binds each
   attention layer to a view. A block table maps logical token positions to
   reusable physical blocks. Since SDPA cannot consume that table directly, K/V
-  pages are gathered into logical order before attention. There is no prefix
-  sharing.
+  pages are gathered into padded batched tensors before attention. Variable
+  sequence lengths are isolated with attention masks. There is no prefix sharing.
 - **Layout:** mirrors `nano-vllm/nanovllm/` (`engine/`, `layers/`, `models/`,
-  `utils/`). `block_manager` and `context` support paged caching; the continuous
-  batching `scheduler` remains intentionally omitted.
+  `utils/`). `block_manager` and `context` support paged caching. The minimal
+  `scheduler` owns KV-block allocation, manages waiting/running requests,
+  prioritizes prefill, and preempts on block pressure. It does not implement
+  chunked prefill or prefix sharing.
 - Single GPU, `tp_size == 1` (all `torch.distributed` machinery removed).
 
 See `docs/superpowers/specs/` for the full design and `docs/superpowers/plans/`

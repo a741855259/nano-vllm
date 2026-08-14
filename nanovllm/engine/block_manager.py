@@ -4,23 +4,33 @@ from nanovllm.engine.sequence import Sequence
 
 
 class BlockManager:
-    """Minimal physical-block allocator for serial sequence execution."""
+    """Physical KV-block allocator owned by the scheduler."""
 
-    def __init__(self, num_blocks: int):
+    def __init__(self, num_blocks: int, block_size: int):
         assert num_blocks > 0
-        self.num_blocks = num_blocks
+        self.total_blocks = num_blocks
+        self.block_size = block_size
         self.free_block_ids = deque(range(num_blocks))
 
-    def ensure_capacity(self, seq: Sequence, num_blocks: int):
-        num_new_blocks = num_blocks - len(seq.block_table)
-        if num_new_blocks <= 0:
-            return
-        if num_new_blocks > len(self.free_block_ids):
-            raise RuntimeError(
-                f"KV cache exhausted: need {num_new_blocks} more blocks, "
-                f"only {len(self.free_block_ids)} free"
-            )
-        for _ in range(num_new_blocks):
+    def num_blocks(self, seq: Sequence):
+        return (len(seq) + self.block_size - 1) // self.block_size
+
+    def can_allocate(self, seq: Sequence):
+        return len(self.free_block_ids) >= self.num_blocks(seq)
+
+    def allocate(self, seq: Sequence):
+        assert not seq.block_table
+        assert self.can_allocate(seq)
+        for _ in range(self.num_blocks(seq)):
+            seq.block_table.append(self.free_block_ids.popleft())
+
+    def can_append(self, seq: Sequence):
+        needs_block = len(seq) % self.block_size == 1
+        return not needs_block or bool(self.free_block_ids)
+
+    def may_append(self, seq: Sequence):
+        if len(seq) % self.block_size == 1:
+            assert self.free_block_ids
             seq.block_table.append(self.free_block_ids.popleft())
 
     def deallocate(self, seq: Sequence):
