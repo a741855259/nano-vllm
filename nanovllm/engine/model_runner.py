@@ -101,7 +101,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, device=device)
         block_tables = torch.tensor(block_tables, dtype=torch.int32, device=device)
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, device=device)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int64, device=device)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
         set_context(
             is_prefill,
             slot_mapping,
