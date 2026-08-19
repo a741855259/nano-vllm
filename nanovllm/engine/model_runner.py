@@ -86,7 +86,7 @@ class ModelRunner:
 
         max_num_blocks = max(len(seq.block_table) for seq in seqs)
         block_tables = [
-            seq.block_table + [0] * (max_num_blocks - len(seq.block_table))
+            seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
             for seq in seqs
         ]
         cu_seqlens_q = [0]
@@ -96,9 +96,11 @@ class ModelRunner:
         device = self.kv_cache.device
         input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
         positions = torch.tensor(positions, dtype=torch.int64, device=device)
+        # index_copy_ requires an int64 index. FlashAttention consumes the
+        # cache metadata below as int32.
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, device=device)
-        block_tables = torch.tensor(block_tables, dtype=torch.int64, device=device)
-        context_lens_tensor = torch.tensor(context_lens, dtype=torch.int64, device=device)
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, device=device)
+        context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, device=device)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int64, device=device)
         set_context(
             is_prefill,

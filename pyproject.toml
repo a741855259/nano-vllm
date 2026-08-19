@@ -5,8 +5,27 @@ description = "A minimal Qwen3 model loader + inference engine, referencing nano
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "torch",
+    # torch 2.13 has no prebuilt flash-attn wheel, and building flash-attn from
+    # source needs nvcc (not installed here). 2.9.0+cu130 is the newest torch
+    # release that flash-attn ships a cu13 prebuilt wheel for, so pin it and
+    # pull that wheel directly (see [tool.uv.sources] below) — no compilation.
+    "torch==2.9.0+cu130",
+    "flash-attn>=2.8.3,<2.9",
     "transformers",
     "safetensors",
     "tqdm",
 ]
+
+# Dedicated index for the CUDA 13.0 torch wheels (torch is sourced from here).
+# `explicit = true` keeps it off-limits to every other package, which still
+# resolve from the configured default (Tsinghua) PyPI mirror.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+# Prebuilt cu13 / torch 2.9 / cp312 / cxx11-abi-TRUE wheel. Matches the
+# cxx11_abi=True of torch's manylinux_2_28 cu130 builds.
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
