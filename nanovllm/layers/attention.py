@@ -21,7 +21,6 @@ class Attention(nn.Module):
         context = get_context()
         assert self.k_cache is not None and self.v_cache is not None
         assert context.slot_mapping is not None
-        assert context.block_tables is not None and context.context_lens is not None
         assert context.cu_seqlens_q is not None
 
         # Write new K/V into physical cache slots selected by the block table.
@@ -33,24 +32,35 @@ class Attention(nn.Module):
         flat_v_cache.index_copy_(0, context.slot_mapping, v)
 
         if context.is_prefill:
-            # Full prefill has no cached prefix, so Q/K/V share the same packed
-            # sequence boundaries. FlashAttention handles variable lengths and
-            # GQA directly without padding, explicit masks, or K/V head copies.
+            if context.block_tables is None:
+                # No cached prefix: packed Q/K/V share sequence boundaries.
+                attn_k = k
+                attn_v = v
+                cu_seqlens_k = context.cu_seqlens_q
+            else:
+                # Chunked prefill: this layer's new K/V have just been written
+                # above, so paged K/V now contains both the prefix and chunk.
+                assert context.cu_seqlens_k is not None
+                attn_k = self.k_cache
+                attn_v = self.v_cache
+                cu_seqlens_k = context.cu_seqlens_k
             o = flash_attn_varlen_func(
                 q,
-                k,
-                v,
+                attn_k,
+                attn_v,
                 cu_seqlens_q=context.cu_seqlens_q,
-                cu_seqlens_k=context.cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q,
                 max_seqlen_k=context.max_seqlen_k,
                 softmax_scale=self.scale,
                 causal=True,
+                block_table=context.block_tables,
             )
             return o.reshape(num_tokens, self.num_heads * self.head_dim)
 
         # Decode has one query token per request. The kernel follows each block
         # table and reads the paged cache directly.
+        assert context.block_tables is not None and context.context_lens is not None
         batch_size = context.context_lens.numel()
         assert num_tokens == batch_size
         o = flash_attn_with_kvcache(

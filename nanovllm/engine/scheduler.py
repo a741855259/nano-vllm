@@ -6,10 +6,11 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 
 
 class Scheduler:
-    """Minimal KV-aware scheduler without prefix caching or chunked prefill."""
+    """KV-aware scheduler with reference-style chunked prefill."""
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
+        self.max_num_batched_tokens = config.max_num_batched_tokens
         self.max_model_len = config.max_model_len
         self.eos = config.eos
         self.block_manager = BlockManager(
@@ -30,17 +31,38 @@ class Scheduler:
             self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        """Prefer new prefills; otherwise schedule one decode step per request."""
+        """Prefer prefills, bounded by a per-step token budget.
+
+        As in nano-vllm, a request is only split when it is the first request in
+        the prefill batch. This avoids fragmenting an otherwise short prompt
+        merely to fill the tail of an existing batch.
+        """
         prefill = []
+        num_batched_tokens = 0
         while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
-            if not self.block_manager.can_allocate(seq):
+            remaining_budget = self.max_num_batched_tokens - num_batched_tokens
+            if remaining_budget == 0:
                 break
-            self.block_manager.allocate(seq)
-            self.waiting.popleft()
-            seq.status = SequenceStatus.RUNNING
-            self.running.append(seq)
+
+            num_tokens = len(seq) - seq.num_cached_tokens
+            assert num_tokens > 0
+            if remaining_budget < num_tokens and prefill:
+                break
+
+            if not seq.block_table:
+                if not self.block_manager.can_allocate(seq):
+                    break
+                self.block_manager.allocate(seq)
+
+            seq.num_scheduled_tokens = min(num_tokens, remaining_budget)
+            num_batched_tokens += seq.num_scheduled_tokens
             prefill.append(seq)
+
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq):
+                self.waiting.popleft()
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
         if prefill:
             return prefill, True
 
@@ -55,6 +77,7 @@ class Scheduler:
                     break
             else:
                 self.block_manager.may_append(seq)
+                seq.num_scheduled_tokens = 1
                 decode.append(seq)
         self.running.extendleft(reversed(decode))
         return decode, False
@@ -71,10 +94,22 @@ class Scheduler:
             return True
         return not seq.ignore_eos and seq.last_token == self.eos
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
+    def postprocess(
+        self,
+        seqs: list[Sequence],
+        token_ids: list[int | None],
+        is_prefill: bool,
+    ):
         assert len(seqs) == len(token_ids)
         for seq, token_id in zip(seqs, token_ids):
-            seq.num_cached_tokens = len(seq)
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+
+            if is_prefill and seq.num_cached_tokens < len(seq):
+                assert token_id is None
+                continue
+
+            assert token_id is not None
             seq.append_token(token_id)
             if self._finished(seq):
                 seq.status = SequenceStatus.FINISHED

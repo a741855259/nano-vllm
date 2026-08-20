@@ -28,10 +28,14 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(len(seq.prompt_token_ids) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = (
+            sum(seq.num_scheduled_tokens for seq in seqs)
+            if is_prefill
+            else -len(seqs)
+        )
         if seqs:
             token_ids = self.model_runner.run(seqs, is_prefill)
-            self.scheduler.postprocess(seqs, token_ids)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         finished = self.scheduler.pop_finished()
         assert seqs or finished, "step called with no scheduled sequences"
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]

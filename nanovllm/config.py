@@ -6,6 +6,7 @@ from transformers import AutoConfig
 @dataclass
 class Config:
     model: str
+    max_num_batched_tokens: int = 4096
     max_num_seqs: int = 3
     max_model_len: int = 4096
     kvcache_block_size: int = 256
@@ -15,6 +16,7 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model), f"model path does not exist: {self.model}"
+        assert self.max_num_batched_tokens > 0
         assert self.max_num_seqs > 0
         assert self.kvcache_block_size > 0
         assert self.kvcache_block_size % 256 == 0, (

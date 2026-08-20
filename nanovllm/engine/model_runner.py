@@ -57,41 +57,57 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         query_lens = []
+        key_lens = []
         context_lens = []
         for seq in seqs:
-            required_blocks = (len(seq) + self.block_size - 1) // self.block_size
-            assert len(seq.block_table) >= required_blocks, (
-                "scheduler did not allocate enough KV-cache blocks"
-            )
             if is_prefill:
-                assert seq.num_cached_tokens == 0
-                seq_input_ids = seq.token_ids
-                seq_positions = list(range(len(seq)))
+                start = seq.num_cached_tokens
+                end = start + seq.num_scheduled_tokens
+                assert start < end <= len(seq)
+                seq_input_ids = seq.token_ids[start:end]
+                seq_positions = list(range(start, end))
             else:
                 assert seq.num_cached_tokens == len(seq) - 1, (
                     f"KV cache has {seq.num_cached_tokens} tokens, expected {len(seq) - 1}"
                 )
+                assert seq.num_scheduled_tokens == 1
+                start = len(seq) - 1
+                end = len(seq)
                 seq_input_ids = [seq.last_token]
-                seq_positions = [len(seq) - 1]
+                seq_positions = [start]
+
+            required_blocks = (end + self.block_size - 1) // self.block_size
+            assert len(seq.block_table) >= required_blocks, (
+                "scheduler did not allocate enough KV-cache blocks"
+            )
 
             input_ids.extend(seq_input_ids)
             positions.extend(seq_positions)
             query_lens.append(len(seq_input_ids))
-            context_lens.append(len(seq))
+            key_lens.append(end)
+            context_lens.append(end)
             slot_mapping.extend(
                 seq.block_table[position // self.block_size] * self.block_size
                 + position % self.block_size
                 for position in seq_positions
             )
 
-        max_num_blocks = max(len(seq.block_table) for seq in seqs)
-        block_tables = [
-            seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
-            for seq in seqs
-        ]
+        # Full prefill can attend directly to its packed K/V. A later chunk (or
+        # decode) must follow the block table to include the cached prefix.
+        use_paged_kv = not is_prefill or any(seq.num_cached_tokens > 0 for seq in seqs)
+        block_tables = None
+        if use_paged_kv:
+            max_num_blocks = max(len(seq.block_table) for seq in seqs)
+            block_tables = [
+                seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
+                for seq in seqs
+            ]
         cu_seqlens_q = [0]
         for query_len in query_lens:
             cu_seqlens_q.append(cu_seqlens_q[-1] + query_len)
+        cu_seqlens_k = [0]
+        for key_len in key_lens:
+            cu_seqlens_k.append(cu_seqlens_k[-1] + key_len)
 
         device = self.kv_cache.device
         input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
@@ -99,23 +115,26 @@ class ModelRunner:
         # index_copy_ requires an int64 index. FlashAttention consumes the
         # cache metadata below as int32.
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, device=device)
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, device=device)
+        if block_tables is not None:
+            block_tables = torch.tensor(block_tables, dtype=torch.int32, device=device)
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, device=device)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
         set_context(
             is_prefill,
             slot_mapping,
             block_tables,
             context_lens_tensor,
             cu_seqlens_q,
+            cu_seqlens_k,
             max(query_lens),
-            max(context_lens),
+            max(key_lens),
             self.block_size,
         )
         return input_ids, positions, cu_seqlens_q
 
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int | None]:
         """Run one packed prefill or decode batch in a single model forward."""
         assert seqs, "seqs must not be empty"
         input_ids, positions, cu_seqlens_q = self._prepare_batch(seqs, is_prefill)
@@ -124,10 +143,23 @@ class ModelRunner:
         finally:
             reset_context()
 
-        if is_prefill:
-            hidden_states = hidden_states[cu_seqlens_q[1:] - 1]
-        logits = self.model.compute_logits(hidden_states.contiguous())
-        temperatures = torch.tensor(
-            [seq.temperature for seq in seqs], dtype=torch.float32, device=self.kv_cache.device,
-        )
-        return self.sampler(logits, temperatures).tolist()
+        last_hidden_states = hidden_states[cu_seqlens_q[1:] - 1]
+        sample_indices = [
+            i
+            for i, seq in enumerate(seqs)
+            if not is_prefill
+            or seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)
+        ]
+        token_ids: list[int | None] = [None] * len(seqs)
+        if sample_indices:
+            sample_hidden_states = last_hidden_states[sample_indices].contiguous()
+            logits = self.model.compute_logits(sample_hidden_states)
+            temperatures = torch.tensor(
+                [seqs[i].temperature for i in sample_indices],
+                dtype=torch.float32,
+                device=self.kv_cache.device,
+            )
+            sampled = self.sampler(logits, temperatures).tolist()
+            for i, token_id in zip(sample_indices, sampled):
+                token_ids[i] = token_id
+        return token_ids

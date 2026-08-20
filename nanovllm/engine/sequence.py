@@ -23,6 +23,7 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.block_table: list[int] = []
         self.num_cached_tokens = 0
+        self.num_scheduled_tokens = 0
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
