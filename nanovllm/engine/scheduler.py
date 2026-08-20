@@ -13,6 +13,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.max_model_len = config.max_model_len
         self.eos = config.eos
+        self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size,
         )
@@ -39,21 +40,32 @@ class Scheduler:
         """
         prefill = []
         num_batched_tokens = 0
-        while self.waiting and len(self.running) < self.max_num_seqs:
+        while (
+            self.waiting
+            and len(prefill) < self.max_num_seqs
+        ):
             seq = self.waiting[0]
             remaining_budget = self.max_num_batched_tokens - num_batched_tokens
             if remaining_budget == 0:
                 break
 
-            num_tokens = len(seq) - seq.num_cached_tokens
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    break
+                num_tokens = (
+                    len(seq)
+                    - num_cached_blocks * self.block_size
+                )
+            else:
+                num_cached_blocks = 0
+                num_tokens = len(seq) - seq.num_cached_tokens
             assert num_tokens > 0
             if remaining_budget < num_tokens and prefill:
                 break
 
             if not seq.block_table:
-                if not self.block_manager.can_allocate(seq):
-                    break
-                self.block_manager.allocate(seq)
+                self.block_manager.allocate(seq, num_cached_blocks)
 
             seq.num_scheduled_tokens = min(num_tokens, remaining_budget)
             num_batched_tokens += seq.num_scheduled_tokens
@@ -83,8 +95,8 @@ class Scheduler:
         return decode, False
 
     def preempt(self, seq: Sequence):
-        self.block_manager.deallocate(seq)
         seq.status = SequenceStatus.WAITING
+        self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
     def _finished(self, seq: Sequence):
@@ -102,6 +114,9 @@ class Scheduler:
     ):
         assert len(seqs) == len(token_ids)
         for seq, token_id in zip(seqs, token_ids):
+            # Publish only after the model has written the scheduled tokens'
+            # K/V into their physical cache slots.
+            self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
 

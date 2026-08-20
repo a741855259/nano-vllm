@@ -14,6 +14,7 @@ dependencies = [
     "transformers",
     "safetensors",
     "tqdm",
+    "xxhash",
 ]
 
 # Dedicated index for the CUDA 13.0 torch wheels (torch is sourced from here).

@@ -16,6 +16,7 @@ class LLMEngine:
         config_fields = {k for k in Config.__dataclass_fields__} - {"hf_config", "eos"}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = Config(model, **config_kwargs)
+        Sequence.block_size = self.config.kvcache_block_size
         self.model_runner = ModelRunner(self.config)
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.model, use_fast=True)
         self.config.eos = self.tokenizer.eos_token_id

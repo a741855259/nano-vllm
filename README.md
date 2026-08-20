@@ -5,25 +5,24 @@ A minimal Qwen3 model-structure loader + inference engine, referencing
 
 It loads Qwen3 weights from safetensors and runs greedy / temperature-sampled
 generation on GPU. It includes a minimal paged KV cache and request scheduler,
-plus packed prefill and batched decode. It does not include nano-vllm's other
-inference optimizations (prefix caching, tensor parallelism, CUDA graphs,
-`torch.compile`, flash_attn, triton).
+plus packed prefill, block-level prefix caching, and batched decode. It does
+not include nano-vllm's other inference optimizations (tensor parallelism,
+CUDA graphs, `torch.compile`, or Triton KV-cache writes).
 The model itself is implemented from scratch; `transformers` is used only for
 the tokenizer, the config, and the chat template.
 
 ## Design
 
-- **Attention:** `F.scaled_dot_product_attention` with a preallocated, per-layer
-  paged KV cache. `ModelRunner` owns one unified cache tensor and binds each
-  attention layer to a view. A block table maps logical token positions to
-  reusable physical blocks. Since SDPA cannot consume that table directly, K/V
-  pages are gathered into padded batched tensors before attention. Variable
-  sequence lengths are isolated with attention masks. There is no prefix sharing.
+- **Attention:** a preallocated, per-layer paged KV cache with FlashAttention.
+  Full prefill uses packed Q/K/V with `flash_attn_varlen_func`; decode uses
+  `flash_attn_with_kvcache` to consume block tables directly. KV writes still
+  use PyTorch `index_copy_`. Prefill is chunked by a per-step token budget.
 - **Layout:** mirrors `nano-vllm/nanovllm/` (`engine/`, `layers/`, `models/`,
   `utils/`). `block_manager` and `context` support paged caching. The minimal
   `scheduler` owns KV-block allocation, manages waiting/running requests,
-  prioritizes prefill, and preempts on block pressure. It does not implement
-  chunked prefill or prefix sharing.
+  prioritizes prefill, supports reference-style chunked prefill, shares
+  immutable full prefix blocks by chained xxHash64 token hashes, and preempts
+  on block pressure.
 - Single GPU, `tp_size == 1` (all `torch.distributed` machinery removed).
 
 See `docs/superpowers/specs/` for the full design and `docs/superpowers/plans/`
@@ -31,8 +30,9 @@ for the implementation plan.
 
 ## Run
 
-Dependencies are pre-installed in the shared uv env at `/root/Infer/.venv`
-(torch 2.13+cu130, transformers, safetensors, tqdm).
+Install the locked dependencies with `uv sync`. FlashAttention requires either
+a wheel matching the Python, PyTorch, CUDA, and C++ ABI versions or a local CUDA
+toolkit with `nvcc` for a source build.
 
 ```bash
 # smoke test (greedy, 3 chat-templated prompts)
@@ -42,8 +42,7 @@ PYTHONPATH=. /root/Infer/.venv/bin/python main.py
 PYTHONPATH=. /root/Infer/.venv/bin/python check.py
 
 # unit tests
-PYTHONPATH=. /root/Infer/.venv/bin/python tests/test_layers.py
-PYTHONPATH=. /root/Infer/.venv/bin/python tests/test_attention.py
+PYTHONPATH=. /root/Infer/.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Point `model_path` in `main.py` / `check.py` at a Qwen3 checkpoint
