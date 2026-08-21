@@ -319,6 +319,7 @@ dependencies = [
     { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "triton" },
     { name = "xxhash" },
 ]
 
@@ -329,6 +330,7 @@ requires-dist = [
     { name = "torch", specifier = "==2.9.0+cu130", index = "https://download.pytorch.org/whl/cu130" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "triton", specifier = ">=3.0.0" },
     { name = "xxhash" },
 ]
 

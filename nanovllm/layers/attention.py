@@ -1,8 +1,74 @@
 import torch
 from torch import nn
+import triton
+import triton.language as tl
+
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 from nanovllm.utils.context import get_context
+
+
+@triton.jit
+def store_kvcache_kernel(
+    key_ptr,        # [N, Hkv, Dh]
+    key_stride,     # Hkv*Dh
+    value_ptr,      # [N, Hkv, Dh]
+    value_stride,   # Hkv*Dh
+    k_cache_ptr,    # [B, S, Hkv, Dh]
+    v_cache_ptr,    # [B, S, Hkv, Dh]
+    slot_mapping_ptr,   # [N]
+    D: tl.constexpr,
+):
+    # idx 是标量，表示当前处理的 token 编号
+    idx = tl.program_id(0)
+    # slot 也是标量，表示目标物理 cache slot
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1:
+        return
+    # 以下变为长度D的向量
+    key_offsets = idx * key_stride + tl.arange(0, D)
+    value_offsets = idx * value_stride + tl.arange(0, D)
+    # 第idx个Token 这一层的k/v
+    key = tl.load(key_ptr + key_offsets)
+    value = tl.load(value_ptr + value_offsets)
+    cache_offsets = slot * D + tl.arange(0, D)
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
+
+
+def store_kvcache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
+    # N   = 本轮 token 总数
+    # Hq  = num_attention_heads
+    # Hkv = num_key_value_heads
+    # Dh  = head_dim
+    # D   = Hkv * Dh
+    # B   = KV cache block 数量
+    # S   = block_size
+    N, num_heads, head_dim = key.shape
+    D = num_heads * head_dim
+    assert key.stride(-1) == 1 and value.stride(-1) == 1
+    assert key.stride(1) == head_dim and value.stride(1) == head_dim
+    assert k_cache.stride(1) == D and v_cache.stride(1) == D
+    assert slot_mapping.numel() == N
+    # Triton 中 pointer 本身不携带这些 shape 信息
+    # 因此 kernel 必须通过 stride 和 D 自行进行地址计算
+    # 启动 N 个program
+    store_kvcache_kernel[(N,)](
+        key,
+        key.stride(0),
+        value,
+        value.stride(0),
+        k_cache,
+        v_cache,
+        slot_mapping,
+        D,
+    )
 
 
 class Attention(nn.Module):
@@ -23,13 +89,8 @@ class Attention(nn.Module):
         assert context.slot_mapping is not None
         assert context.cu_seqlens_q is not None
 
-        # Write new K/V into physical cache slots selected by the block table.
         num_tokens = q.size(0)
-        assert context.slot_mapping.numel() == num_tokens
-        flat_k_cache = self.k_cache.flatten(0, 1)
-        flat_v_cache = self.v_cache.flatten(0, 1)
-        flat_k_cache.index_copy_(0, context.slot_mapping, k)
-        flat_v_cache.index_copy_(0, context.slot_mapping, v)
+        store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
 
         if context.is_prefill:
             if context.block_tables is None:

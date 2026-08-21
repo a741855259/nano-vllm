@@ -112,9 +112,7 @@ class ModelRunner:
         device = self.kv_cache.device
         input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
         positions = torch.tensor(positions, dtype=torch.int64, device=device)
-        # index_copy_ requires an int64 index. FlashAttention consumes the
-        # cache metadata below as int32.
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, device=device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=device)
         if block_tables is not None:
             block_tables = torch.tensor(block_tables, dtype=torch.int32, device=device)
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, device=device)

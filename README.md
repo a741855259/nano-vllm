@@ -5,9 +5,9 @@ A minimal Qwen3 model-structure loader + inference engine, referencing
 
 It loads Qwen3 weights from safetensors and runs greedy / temperature-sampled
 generation on GPU. It includes a minimal paged KV cache and request scheduler,
-plus packed prefill, block-level prefix caching, and batched decode. It does
-not include nano-vllm's other inference optimizations (tensor parallelism,
-CUDA graphs, `torch.compile`, or Triton KV-cache writes).
+plus packed prefill, block-level prefix caching, batched decode, and Triton
+KV-cache writes. It does not include nano-vllm's other inference optimizations
+(tensor parallelism, CUDA graphs, or `torch.compile`).
 The model itself is implemented from scratch; `transformers` is used only for
 the tokenizer, the config, and the chat template.
 
@@ -15,8 +15,8 @@ the tokenizer, the config, and the chat template.
 
 - **Attention:** a preallocated, per-layer paged KV cache with FlashAttention.
   Full prefill uses packed Q/K/V with `flash_attn_varlen_func`; decode uses
-  `flash_attn_with_kvcache` to consume block tables directly. KV writes still
-  use PyTorch `index_copy_`. Prefill is chunked by a per-step token budget.
+  `flash_attn_with_kvcache` to consume block tables directly. KV writes use a
+  Triton kernel. Prefill is chunked by a per-step token budget.
 - **Layout:** mirrors `nano-vllm/nanovllm/` (`engine/`, `layers/`, `models/`,
   `utils/`). `block_manager` and `context` support paged caching. The minimal
   `scheduler` owns KV-block allocation, manages waiting/running requests,
