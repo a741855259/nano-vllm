@@ -9,6 +9,7 @@ class Config:
     max_num_batched_tokens: int = 4096
     max_num_seqs: int = 3
     max_model_len: int = 4096
+    gpu_memory_utilization: float = 0.9
     enforce_eager: bool = False
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -25,9 +26,3 @@ class Config:
         )
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
-        min_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
-        if self.num_kvcache_blocks == -1:
-            self.num_kvcache_blocks = min_blocks
-        assert self.num_kvcache_blocks >= min_blocks, (
-            f"num_kvcache_blocks must be at least {min_blocks} for max_model_len"
-        )

@@ -16,7 +16,9 @@ the tokenizer, the config, and the chat template.
 - **Attention:** a preallocated, per-layer paged KV cache with FlashAttention.
   Full prefill uses packed Q/K/V with `flash_attn_varlen_func`; decode uses
   `flash_attn_with_kvcache` to consume block tables directly. KV writes use a
-  Triton kernel. Prefill is chunked by a per-step token budget.
+  Triton kernel. Prefill is chunked by a per-step token budget. At startup the
+  model is warmed up and the number of KV-cache blocks is derived from measured
+  peak memory and `gpu_memory_utilization`, matching nano-vllm.
 - **Layout:** mirrors `nano-vllm/nanovllm/` (`engine/`, `layers/`, `models/`,
   `utils/`). `block_manager` and `context` support paged caching. The minimal
   `scheduler` owns KV-block allocation, manages waiting/running requests,
@@ -53,7 +55,11 @@ Point `model_path` in `main.py` / `check.py` at a Qwen3 checkpoint
 ```python
 from nanovllm import LLM, SamplingParams
 
-llm = LLM("/path/to/Qwen3-0.6B", max_model_len=4096)
+llm = LLM(
+    "/path/to/Qwen3-0.6B",
+    max_model_len=4096,
+    gpu_memory_utilization=0.9,
+)
 sp = SamplingParams(temperature=0.0, max_tokens=256)   # temperature <= 0 -> greedy
 outputs = llm.generate(["Hello."], sp)
 print(outputs[0]["text"])

@@ -80,16 +80,20 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.register_buffer("k_cache", None, persistent=False)
-        self.register_buffer("v_cache", None, persistent=False)
+        # warmup时还不知道能分配多少 KV block，所以不能创建正式 cache
+        # 让每个 Attention 层先持有空 tensor:
+        self.register_buffer("k_cache", torch.tensor([]), persistent=False)
+        self.register_buffer("v_cache", torch.tensor([]), persistent=False)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
-        assert self.k_cache is not None and self.v_cache is not None
-        assert context.slot_mapping is not None
-
         num_tokens = q.size(0)
-        store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
+        # 判断 cache 是否已经分配：
+        # warmup 阶段k_cache和v_cache都未分配，所以不执行 Triton KV 写入。
+        # prefill attention 仍然可以运行，因为第一次完整 prefill 不需要读取 paged KV cache，可以直接对当前的 packed Q/K/V 执行
+        if self.k_cache.numel() and self.v_cache.numel():
+            assert context.slot_mapping is not None
+            store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
 
         if context.is_prefill:
             assert context.cu_seqlens_q is not None

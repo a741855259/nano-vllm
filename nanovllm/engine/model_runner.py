@@ -25,21 +25,54 @@ class ModelRunner:
         self.sampler = Sampler()
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+    def warmup_model(self):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        max_num_batched_tokens = self.config.max_num_batched_tokens
+        max_model_len = self.config.max_model_len
+        seq_len = min(max_num_batched_tokens, max_model_len)
+        num_seqs = min(
+            max_num_batched_tokens // seq_len,
+            self.config.max_num_seqs,
+        )
+        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
+        for seq in seqs:
+            seq.num_scheduled_tokens = seq_len
+        self.run(seqs, True)
+        torch.cuda.empty_cache()
+
     def allocate_kv_cache(self):
-        """Allocate one cache pool and bind each attention layer to a view."""
         config = self.config
         hf_config = config.hf_config
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_layers = hf_config.num_hidden_layers
         num_kv_heads = hf_config.num_key_value_heads
         head_dim = getattr(
             hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads,
         )
+        block_bytes = (
+            2
+            * num_layers
+            * self.block_size
+            * num_kv_heads
+            * head_dim
+            * hf_config.dtype.itemsize
+        )
+        config.num_kvcache_blocks = (
+            int(total * config.gpu_memory_utilization - used - (peak - current))
+            // block_bytes
+        )
+        assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(
             2,
             num_layers,
@@ -79,21 +112,23 @@ class ModelRunner:
                 seq_input_ids = [seq.last_token]
                 seq_positions = [start]
 
-            required_blocks = (end + self.block_size - 1) // self.block_size
-            assert len(seq.block_table) >= required_blocks, (
-                "scheduler did not allocate enough KV-cache blocks"
-            )
+            if seq.block_table:
+                required_blocks = (end + self.block_size - 1) // self.block_size
+                assert len(seq.block_table) >= required_blocks, (
+                    "scheduler did not allocate enough KV-cache blocks"
+                )
 
             input_ids.extend(seq_input_ids)
             positions.extend(seq_positions)
             query_lens.append(len(seq_input_ids))
             key_lens.append(end)
             context_lens.append(end)
-            slot_mapping.extend(
-                seq.block_table[position // self.block_size] * self.block_size
-                + position % self.block_size
-                for position in seq_positions
-            )
+            if seq.block_table:
+                slot_mapping.extend(
+                    seq.block_table[position // self.block_size] * self.block_size
+                    + position % self.block_size
+                    for position in seq_positions
+                )
 
         # Full prefill can attend directly to its packed K/V. A later chunk (or
         # decode) must follow the block table to include the cached prefix.
@@ -112,7 +147,7 @@ class ModelRunner:
         for key_len in key_lens:
             cu_seqlens_k.append(cu_seqlens_k[-1] + key_len)
 
-        device = self.kv_cache.device
+        device = self.kv_cache.device if hasattr(self, "kv_cache") else torch.device("cuda")
         input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
         positions = torch.tensor(positions, dtype=torch.int64, device=device)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=device)
@@ -183,7 +218,7 @@ class ModelRunner:
             temperatures = torch.tensor(
                 [seqs[i].temperature for i in sample_indices],
                 dtype=torch.float32,
-                device=self.kv_cache.device,
+                device=hidden_states.device,
             )
             sampled = self.sampler(logits, temperatures).tolist()
             for i, token_id in zip(sample_indices, sampled):
