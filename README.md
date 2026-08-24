@@ -6,8 +6,8 @@ A minimal Qwen3 model-structure loader + inference engine, referencing
 It loads Qwen3 weights from safetensors and runs greedy / temperature-sampled
 generation on GPU. It includes a minimal paged KV cache and request scheduler,
 plus packed prefill, block-level prefix caching, batched decode, and Triton
-KV-cache writes. It does not include nano-vllm's other inference optimizations
-(tensor parallelism, CUDA graphs, or `torch.compile`).
+KV-cache writes and CUDA Graph decode. It does not include nano-vllm's other
+inference optimizations (tensor parallelism or `torch.compile`).
 The model itself is implemented from scratch; `transformers` is used only for
 the tokenizer, the config, and the chat template.
 

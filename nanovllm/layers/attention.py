@@ -87,12 +87,12 @@ class Attention(nn.Module):
         context = get_context()
         assert self.k_cache is not None and self.v_cache is not None
         assert context.slot_mapping is not None
-        assert context.cu_seqlens_q is not None
 
         num_tokens = q.size(0)
         store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
 
         if context.is_prefill:
+            assert context.cu_seqlens_q is not None
             if context.block_tables is None:
                 # No cached prefix: packed Q/K/V share sequence boundaries.
                 attn_k = k

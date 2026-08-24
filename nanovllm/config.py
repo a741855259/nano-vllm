@@ -9,6 +9,7 @@ class Config:
     max_num_batched_tokens: int = 4096
     max_num_seqs: int = 3
     max_model_len: int = 4096
+    enforce_eager: bool = False
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     eos: int = -1
