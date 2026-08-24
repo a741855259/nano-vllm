@@ -29,12 +29,26 @@ def main():
     hf_token = hf_logits.argmax(dim=-1).item()
     hf_top = torch.topk(hf_logits.float(), 5).indices.tolist()
 
-    # --- our engine (greedy, single forward over the prompt) ---
-    llm = LLM(model_path, max_model_len=4096)
-    from nanovllm.engine.sequence import Sequence
+    # --- our model (single forward over the prompt) ---
+    llm = LLM(model_path, max_model_len=4096, enforce_eager=True)
     from nanovllm.sampling_params import SamplingParams
-    seq = Sequence(input_ids[0].tolist(), SamplingParams(temperature=0.0, max_tokens=1))
-    our_token = llm.model_runner.run([seq], is_prefill=True)[0]
+    from nanovllm.utils.context import reset_context
+
+    llm.add_request(input_ids[0].tolist(), SamplingParams(max_tokens=1))
+    seqs, is_prefill = llm.scheduler.schedule()
+    model_input_ids, positions, cu_seqlens_q = llm.model_runner._prepare_batch(
+        seqs, is_prefill,
+    )
+    try:
+        hidden_states = llm.model_runner.run_model(
+            model_input_ids, positions, is_prefill,
+        )
+    finally:
+        reset_context()
+    our_logits = llm.model_runner.model.compute_logits(
+        hidden_states[cu_seqlens_q[1:] - 1],
+    )[0]
+    our_token = our_logits.argmax(dim=-1).item()
 
     print(f"prompt tokens : {input_ids.numel()}")
     print(f"HF  argmax id : {hf_token}  ({tokenizer.decode([hf_token])!r})")
