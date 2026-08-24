@@ -3,13 +3,9 @@ from torch import nn
 
 
 class Sampler(nn.Module):
-    """Batched greedy or temperature sampling.
 
-    Temperature sampling uses the same exponential-noise trick as nano-vllm:
-    argmax(softmax(logits/T) / exponential(1)).
-    """
-
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
+    @torch.compile
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         greedy_tokens = logits.argmax(dim=-1)
         greedy = temperatures <= 0
         safe_temperatures = torch.where(greedy, torch.ones_like(temperatures), temperatures)
