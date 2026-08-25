@@ -13,7 +13,6 @@ class Context:
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
-    block_size: int = 0
 
 
 _CONTEXT = Context()
@@ -32,7 +31,6 @@ def set_context(
     cu_seqlens_k: torch.Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
-    block_size: int = 0,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -44,7 +42,6 @@ def set_context(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        block_size,
     )
 
 

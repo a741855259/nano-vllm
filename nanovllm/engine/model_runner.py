@@ -88,86 +88,146 @@ class ModelRunner:
             attention.k_cache = self.kv_cache[0, layer_id]
             attention.v_cache = self.kv_cache[1, layer_id]
 
-    def _prepare_batch(self, seqs: list[Sequence], is_prefill: bool):
+    def prepare_block_tables(self, seqs: list[Sequence]):
+        max_num_blocks = max(len(seq.block_table) for seq in seqs)
+        block_tables = [
+            seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
+            for seq in seqs
+        ]
+        # 1.pin_memory=False时：
+        # 普通 CPU 内存
+        #     ↓ 隐式复制
+        # 临时 pinned 内存
+        #     ↓ DMA
+        # GPU 内存
+        # 2.pin_memory作用：
+        # Pinned CPU 内存
+        #     ↓ DMA
+        # GPU 内存
+        return torch.tensor(
+            block_tables,
+            dtype=torch.int32,
+            # ModelRunner.__init__() 构造模型时设置了：torch.set_default_device("cuda")
+            # 可能受默认设备影响，尝试直接创建在 CUDA 上
+            device="cpu",
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+    def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
         slot_mapping = []
-        query_lens = []
-        key_lens = []
-        context_lens = []
+        block_tables = None
         for seq in seqs:
-            if is_prefill:
-                start = seq.num_cached_tokens
-                end = start + seq.num_scheduled_tokens
-                assert start < end <= len(seq)
-                seq_input_ids = seq.token_ids[start:end]
-                seq_positions = list(range(start, end))
-            else:
-                assert seq.num_cached_tokens == len(seq) - 1, (
-                    f"KV cache has {seq.num_cached_tokens} tokens, expected {len(seq) - 1}"
-                )
-                assert seq.num_scheduled_tokens == 1
-                start = len(seq) - 1
-                end = len(seq)
-                seq_input_ids = [seq.last_token]
-                seq_positions = [start]
-
+            start = seq.num_cached_tokens
+            seqlen_q = seq.num_scheduled_tokens
+            end = start + seqlen_q
+            seqlen_k = end
+            assert start < end <= len(seq)
             if seq.block_table:
                 required_blocks = (end + self.block_size - 1) // self.block_size
                 assert len(seq.block_table) >= required_blocks, (
                     "scheduler did not allocate enough KV-cache blocks"
                 )
-
-            input_ids.extend(seq_input_ids)
-            positions.extend(seq_positions)
-            query_lens.append(len(seq_input_ids))
-            key_lens.append(end)
-            context_lens.append(end)
-            if seq.block_table:
-                slot_mapping.extend(
+            input_ids.extend(seq.token_ids[start:end])
+            positions.extend(range(start, end))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(max_seqlen_q, seqlen_q)
+            max_seqlen_k = max(max_seqlen_k, seqlen_k)
+            if not seq.block_table:  # warmup runs before the paged cache exists
+                continue
+            for position in range(start, end):
+                slot_mapping.append(
                     seq.block_table[position // self.block_size] * self.block_size
                     + position % self.block_size
-                    for position in seq_positions
                 )
 
-        # Full prefill can attend directly to its packed K/V. A later chunk (or
-        # decode) must follow the block table to include the cached prefix.
-        use_paged_kv = not is_prefill or any(seq.num_cached_tokens > 0 for seq in seqs)
-        block_tables = None
-        if use_paged_kv:
-            max_num_blocks = max(len(seq.block_table) for seq in seqs)
-            block_tables = [
-                seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
-                for seq in seqs
-            ]
-        cu_seqlens_q = [0]
-        for query_len in query_lens:
-            cu_seqlens_q.append(cu_seqlens_q[-1] + query_len)
-        cu_seqlens_k = [0]
-        for key_len in key_lens:
-            cu_seqlens_k.append(cu_seqlens_k[-1] + key_len)
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            block_tables = self.prepare_block_tables(seqs)
 
-        device = self.kv_cache.device if hasattr(self, "kv_cache") else torch.device("cuda")
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
-        positions = torch.tensor(positions, dtype=torch.int64, device=device)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=device)
-        if block_tables is not None:
-            block_tables = torch.tensor(block_tables, dtype=torch.int32, device=device)
-        context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, device=device)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
+        input_ids = torch.tensor(
+            input_ids, dtype=torch.int64, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        positions = torch.tensor(
+            positions, dtype=torch.int64, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(
+            cu_seqlens_q, dtype=torch.int32, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(
+            cu_seqlens_k, dtype=torch.int32, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(
+            slot_mapping, dtype=torch.int32, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
         set_context(
-            is_prefill,
-            slot_mapping,
-            block_tables,
-            context_lens_tensor,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max(query_lens),
-            max(key_lens),
-            self.block_size,
+            True,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
         )
         return input_ids, positions, cu_seqlens_q
+
+    def prepare_decode(self, seqs: list[Sequence]):
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            assert seq.num_cached_tokens == len(seq) - 1, (
+                f"KV cache has {seq.num_cached_tokens} tokens, expected {len(seq) - 1}"
+            )
+            assert seq.num_scheduled_tokens == 1
+            position = len(seq) - 1
+            required_blocks = (len(seq) + self.block_size - 1) // self.block_size
+            assert len(seq.block_table) >= required_blocks, (
+                "scheduler did not allocate enough KV-cache blocks"
+            )
+            input_ids.append(seq.last_token)
+            positions.append(position)
+            context_lens.append(len(seq))
+            slot_mapping.append(
+                seq.block_table[position // self.block_size] * self.block_size
+                + position % self.block_size
+            )
+
+        input_ids = torch.tensor(
+            input_ids, dtype=torch.int64, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        positions = torch.tensor(
+            positions, dtype=torch.int64, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(
+            slot_mapping, dtype=torch.int32, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        context_lens = torch.tensor(
+            context_lens, dtype=torch.int32, device="cpu", pin_memory=True,
+        ).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
+        return input_ids, positions
+
+    def prepare_sample(self, seqs: list[Sequence]):
+        temperatures = torch.tensor(
+            [seq.temperature for seq in seqs],
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=True,
+        )
+        return temperatures.cuda(non_blocking=True)
 
     @torch.inference_mode()
     def run_model(
@@ -198,28 +258,36 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int | None]:
         """Run one packed prefill or decode batch in a single model forward."""
         assert seqs, "seqs must not be empty"
-        input_ids, positions, cu_seqlens_q = self._prepare_batch(seqs, is_prefill)
-        try:
-            hidden_states = self.run_model(input_ids, positions, is_prefill)
-        finally:
-            reset_context()
-
-        last_hidden_states = hidden_states[cu_seqlens_q[1:] - 1]
+        if is_prefill:
+            input_ids, positions, cu_seqlens_q = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+            cu_seqlens_q = None
         sample_indices = [
             i
             for i, seq in enumerate(seqs)
             if not is_prefill
             or seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)
         ]
+        temperatures = (
+            self.prepare_sample([seqs[i] for i in sample_indices])
+            if sample_indices
+            else None
+        )
+        try:
+            hidden_states = self.run_model(input_ids, positions, is_prefill)
+        finally:
+            reset_context()
+
+        last_hidden_states = (
+            hidden_states[cu_seqlens_q[1:] - 1]
+            if is_prefill
+            else hidden_states
+        )
         token_ids: list[int | None] = [None] * len(seqs)
         if sample_indices:
             sample_hidden_states = last_hidden_states[sample_indices].contiguous()
             logits = self.model.compute_logits(sample_hidden_states)
-            temperatures = torch.tensor(
-                [seqs[i].temperature for i in sample_indices],
-                dtype=torch.float32,
-                device=hidden_states.device,
-            )
             sampled = self.sampler(logits, temperatures).tolist()
             for i, token_id in zip(sample_indices, sampled):
                 token_ids[i] = token_id
