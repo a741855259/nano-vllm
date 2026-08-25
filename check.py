@@ -36,18 +36,13 @@ def main():
 
     llm.add_request(input_ids[0].tolist(), SamplingParams(max_tokens=1))
     seqs, is_prefill = llm.scheduler.schedule()
-    model_input_ids, positions, cu_seqlens_q = llm.model_runner._prepare_batch(
-        seqs, is_prefill,
-    )
+    model_input_ids, positions, _ = llm.model_runner.prepare_prefill(seqs)
     try:
-        hidden_states = llm.model_runner.run_model(
+        our_logits = llm.model_runner.run_model(
             model_input_ids, positions, is_prefill,
-        )
+        )[0]
     finally:
         reset_context()
-    our_logits = llm.model_runner.model.compute_logits(
-        hidden_states[cu_seqlens_q[1:] - 1],
-    )[0]
     our_token = our_logits.argmax(dim=-1).item()
 
     print(f"prompt tokens : {input_ids.numel()}")
