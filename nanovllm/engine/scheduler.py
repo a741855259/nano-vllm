@@ -11,7 +11,6 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
-        self.max_model_len = config.max_model_len
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(
@@ -19,17 +18,12 @@ class Scheduler:
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
-        self.finished: deque[Sequence] = deque()
 
     def is_finished(self):
-        return not self.waiting and not self.running and not self.finished
+        return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        if self._finished(seq):
-            seq.status = SequenceStatus.FINISHED
-            self.finished.append(seq)
-        else:
-            self.waiting.append(seq)
+        self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         """Prefer prefills, bounded by a per-step token budget.
@@ -91,6 +85,7 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 seq.num_scheduled_tokens = 1
                 decode.append(seq)
+        assert decode
         self.running.extendleft(reversed(decode))
         return decode, False
 
@@ -99,20 +94,12 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def _finished(self, seq: Sequence):
-        if seq.num_completion_tokens >= seq.max_tokens:
-            return True
-        if len(seq) >= self.max_model_len:
-            return True
-        return not seq.ignore_eos and seq.last_token == self.eos
-
     def postprocess(
         self,
         seqs: list[Sequence],
-        token_ids: list[int | None],
+        token_ids: list[int],
         is_prefill: bool,
     ):
-        assert len(seqs) == len(token_ids)
         for seq, token_id in zip(seqs, token_ids):
             # Publish only after the model has written the scheduled tokens'
             # K/V into their physical cache slots.
@@ -121,18 +108,13 @@ class Scheduler:
             seq.num_scheduled_tokens = 0
 
             if is_prefill and seq.num_cached_tokens < len(seq):
-                assert token_id is None
                 continue
 
-            assert token_id is not None
             seq.append_token(token_id)
-            if self._finished(seq):
+            if (
+                (not seq.ignore_eos and token_id == self.eos)
+                or seq.num_completion_tokens == seq.max_tokens
+            ):
                 seq.status = SequenceStatus.FINISHED
-                self.running.remove(seq)
                 self.block_manager.deallocate(seq)
-                self.finished.append(seq)
-
-    def pop_finished(self) -> list[Sequence]:
-        finished = list(self.finished)
-        self.finished.clear()
-        return finished
+                self.running.remove(seq)

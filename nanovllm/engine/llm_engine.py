@@ -34,12 +34,13 @@ class LLMEngine:
             if is_prefill
             else -len(seqs)
         )
-        if seqs:
-            token_ids = self.model_runner.run(seqs, is_prefill)
-            self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        finished = self.scheduler.pop_finished()
-        assert seqs or finished, "step called with no scheduled sequences"
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        token_ids = self.model_runner.run(seqs, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids)
+            for seq in seqs
+            if seq.is_finished
+        ]
         return outputs, num_tokens
 
     def is_finished(self):
