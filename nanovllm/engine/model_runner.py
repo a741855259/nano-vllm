@@ -237,7 +237,7 @@ class ModelRunner:
         is_prefill: bool,
     ) -> torch.Tensor:
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs[-1]:
-            return self.model(input_ids, positions)
+            return self.model.compute_logits(self.model(input_ids, positions))
 
         bs = input_ids.size(0)
         context = get_context()
@@ -252,45 +252,22 @@ class ModelRunner:
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
         graph.replay()
-        return graph_vars["outputs"][:bs]
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int | None]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """Run one packed prefill or decode batch in a single model forward."""
         assert seqs, "seqs must not be empty"
         if is_prefill:
-            input_ids, positions, cu_seqlens_q = self.prepare_prefill(seqs)
+            input_ids, positions, _ = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs)
-            cu_seqlens_q = None
-        sample_indices = [
-            i
-            for i, seq in enumerate(seqs)
-            if not is_prefill
-            or seq.num_cached_tokens + seq.num_scheduled_tokens == len(seq)
-        ]
-        temperatures = (
-            self.prepare_sample([seqs[i] for i in sample_indices])
-            if sample_indices
-            else None
-        )
+        temperatures = self.prepare_sample(seqs)
         try:
-            hidden_states = self.run_model(input_ids, positions, is_prefill)
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist()
         finally:
             reset_context()
-
-        last_hidden_states = (
-            hidden_states[cu_seqlens_q[1:] - 1]
-            if is_prefill
-            else hidden_states
-        )
-        token_ids: list[int | None] = [None] * len(seqs)
-        if sample_indices:
-            sample_hidden_states = last_hidden_states[sample_indices].contiguous()
-            logits = self.model.compute_logits(sample_hidden_states)
-            sampled = self.sampler(logits, temperatures).tolist()
-            for i, token_id in zip(sample_indices, sampled):
-                token_ids[i] = token_id
         return token_ids
 
     @torch.inference_mode()

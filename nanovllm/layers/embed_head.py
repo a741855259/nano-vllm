@@ -2,6 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from nanovllm.utils.context import get_context
+
 
 class VocabParallelEmbedding(nn.Module):
     # Single-GPU: a plain token embedding (no vocab sharding / masking / all-reduce).
@@ -28,4 +30,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        context = get_context()
+        if context.is_prefill:
+            last_indices = context.cu_seqlens_q[1:] - 1
+            x = x[last_indices].contiguous()
         return F.linear(x, self.weight)
