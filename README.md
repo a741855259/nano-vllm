@@ -7,7 +7,8 @@ It loads Qwen3 weights from safetensors and runs greedy / temperature-sampled
 generation on GPU. It includes a minimal paged KV cache and request scheduler,
 plus packed prefill, block-level prefix caching, batched decode, and Triton
 KV-cache writes and CUDA Graph decode. It does not include nano-vllm's other
-inference optimizations (tensor parallelism or `torch.compile`).
+inference optimization for tensor parallelism. Core pointwise operators use
+`torch.compile`.
 The model itself is implemented from scratch; `transformers` is used only for
 the tokenizer, the config, and the chat template.
 
@@ -29,6 +30,14 @@ the tokenizer, the config, and the chat template.
 
 See `docs/superpowers/specs/` for the full design and `docs/superpowers/plans/`
 for the implementation plan.
+
+## Installation
+
+```bash
+pip install .
+```
+
+For development with the locked dependency set, use `uv sync`.
 
 ## Run
 
@@ -64,3 +73,10 @@ sp = SamplingParams(temperature=0.0, max_tokens=256)   # temperature <= 0 -> gre
 outputs = llm.generate(["Hello."], sp)
 print(outputs[0]["text"])
 ```
+
+See `example.py` for a complete chat-template example and `bench.py` for the
+reference-compatible benchmark.
+
+## License
+
+MIT. See `LICENSE`.

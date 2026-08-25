@@ -1,9 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "my-nano-vllm"
 version = "0.1.0"
+authors = [{ name = "winterj" }]
+license = "MIT"
+license-files = ["LICENSE"]
 description = "A minimal Qwen3 model loader + inference engine, referencing nano-vllm."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     # torch 2.13 has no prebuilt flash-attn wheel, and building flash-attn from
     # source needs nvcc (not installed here). 2.9.0+cu130 is the newest torch
@@ -11,12 +18,22 @@ dependencies = [
     # pull that wheel directly (see [tool.uv.sources] below) — no compilation.
     "torch==2.9.0+cu130",
     "triton>=3.0.0",
-    "flash-attn>=2.8.3,<2.9",
-    "transformers",
+    "flash-attn==2.8.3",
+    "transformers>=4.51.0",
     "safetensors",
     "tqdm",
     "xxhash",
 ]
+
+[project.urls]
+Upstream = "https://github.com/a741855259/nano-vllm"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanovllm*"]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 # Dedicated index for the CUDA 13.0 torch wheels (torch is sourced from here).
 # `explicit = true` keeps it off-limits to every other package, which still
