@@ -5,6 +5,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.quantization import get_quantization_config
 from nanovllm.utils.context import get_context, reset_context, set_context
 from nanovllm.utils.loader import load_model
 

@@ -8,7 +8,8 @@ generation on GPU. It includes a minimal paged KV cache and request scheduler,
 plus packed prefill, block-level prefix caching, batched decode, and Triton
 KV-cache writes and CUDA Graph decode. It does not include nano-vllm's other
 inference optimization for tensor parallelism. Core pointwise operators use
-`torch.compile`.
+`torch.compile`. Transformer linear layers can optionally be quantized online
+to symmetric group-wise INT4 weights while keeping activations in BF16.
 The model itself is implemented from scratch; `transformers` is used only for
 the tokenizer, the config, and the chat template.
 
@@ -73,6 +74,28 @@ sp = SamplingParams(temperature=0.0, max_tokens=256)   # temperature <= 0 -> gre
 outputs = llm.generate(["Hello."], sp)
 print(outputs[0]["text"])
 ```
+
+## INT4 weight-only quantization
+
+Pass `quantization="int4"` to quantize the Qwen3 attention and MLP linear
+weights while loading an ordinary BF16/FP16 safetensors checkpoint. Q/K/V and
+gate/up shards remain fused. Embeddings, the LM head, normalization, attention,
+activations, and the KV cache retain their original dtype.
+
+```python
+llm = LLM(
+    "/path/to/Qwen3-0.6B",
+    quantization="int4",
+    quantization_group_size=128,
+)
+```
+
+The format stores two signed INT4 values per byte and one FP16 scale per output
+row and input group. The selected group size must evenly divide every
+Transformer linear layer's input dimension. CUDA inference uses a fused Triton
+dequantization/GEMM kernel; the CPU implementation is a correctness reference,
+not a performance path. Quantization currently reduces weight memory but does
+not quantize the KV cache.
 
 See `example.py` for a complete chat-template example and `bench.py` for the
 reference-compatible benchmark.
