@@ -18,6 +18,7 @@ def store_kvcache_kernel(
     v_cache_ptr,    # [B, S, Hkv, Dh]
     slot_mapping_ptr,   # [N]
     D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     # idx 是标量，表示当前处理的 token 编号
     idx = tl.program_id(0)
@@ -25,15 +26,19 @@ def store_kvcache_kernel(
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1:
         return
-    # 以下变为长度D的向量
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
+    # Triton arange requires a power-of-two range, while MiniMind's
+    # Hkv * head_dim is 4 * 96 = 384. 
+    # 需要取到最近的2幂次(即512)，剩余的mask掉
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < D
+    key_offsets = idx * key_stride + offsets
+    value_offsets = idx * value_stride + offsets
     # 第idx个Token 这一层的k/v
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    key = tl.load(key_ptr + key_offsets, mask=mask)
+    value = tl.load(value_ptr + value_offsets, mask=mask)
+    cache_offsets = slot * D + offsets
+    tl.store(k_cache_ptr + cache_offsets, key, mask=mask)
+    tl.store(v_cache_ptr + cache_offsets, value, mask=mask)
 
 
 def store_kvcache(
@@ -68,6 +73,7 @@ def store_kvcache(
         v_cache,
         slot_mapping,
         D,
+        triton.next_power_of_2(D),
     )
 
 

@@ -116,6 +116,10 @@ class Qwen3MLP(nn.Module):
 
 class Qwen3DecoderLayer(nn.Module):
 
+    @staticmethod
+    def get_attention_bias(config) -> bool:
+        return getattr(config, "attention_bias", True)
+
     def __init__(self, config: Qwen3Config,
                  quant_config: QuantizationConfig | None = None,
                  prefix: str = ""):
@@ -126,7 +130,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, "attention_bias", True),
+            qkv_bias=self.get_attention_bias(config),
             head_dim=getattr(config, "head_dim", None),
             rope_theta=_rope_theta(config),
             rope_scaling=(
@@ -159,13 +163,15 @@ class Qwen3DecoderLayer(nn.Module):
 
 class Qwen3Model(nn.Module):
 
+    decoder_layer_cls = Qwen3DecoderLayer
+
     def __init__(self, config: Qwen3Config,
                  quant_config: QuantizationConfig | None = None,
                  prefix: str = ""):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            Qwen3DecoderLayer(
+            self.decoder_layer_cls(
                 config,
                 quant_config,
                 prefix=_add_prefix(prefix, f"layers.{layer_idx}"),
@@ -174,8 +180,12 @@ class Qwen3Model(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids, positions):
-        hidden_states = self.embed_tokens(input_ids)
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        hidden_states = (
+            self.embed_tokens(input_ids)
+            if inputs_embeds is None
+            else inputs_embeds
+        )
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
@@ -207,8 +217,8 @@ class Qwen3ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
-    def forward(self, input_ids, positions):
-        return self.model(input_ids, positions)
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states):
         return self.lm_head(hidden_states)

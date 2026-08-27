@@ -13,15 +13,18 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        self.extra_keys = ()
 
-    def update(self, hash: int, token_ids: list[int]):
+    def update(self, hash: int, token_ids: list[int], extra_keys=()):
         self.hash = hash
         self.token_ids = token_ids
+        self.extra_keys = extra_keys
 
     def reset(self):
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+        self.extra_keys = ()
 
 
 class BlockManager:
@@ -34,11 +37,14 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1, extra_keys=()):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
+        h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
+        for identifier, offset in extra_keys:
+            h.update(identifier.encode())
+            h.update(int(offset).to_bytes(8, "little", signed=True))
         return h.intdigest()
 
     def _allocate_block(self) -> int:
@@ -62,9 +68,14 @@ class BlockManager:
         num_new_blocks = seq.num_blocks
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            extra_keys = seq.block_extra_keys(i)
+            h = self.compute_hash(token_ids, h, extra_keys)
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            if (
+                block_id == -1
+                or self.blocks[block_id].token_ids != token_ids
+                or self.blocks[block_id].extra_keys != extra_keys
+            ):
                 break
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
@@ -78,7 +89,7 @@ class BlockManager:
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, seq.block_extra_keys(i))
             block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
@@ -117,6 +128,7 @@ class BlockManager:
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block.update(h, token_ids)
+            extra_keys = seq.block_extra_keys(i)
+            h = self.compute_hash(token_ids, h, extra_keys)
+            block.update(h, token_ids, extra_keys)
             self.hash_to_block_id[h] = block.block_id

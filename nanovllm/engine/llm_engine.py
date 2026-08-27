@@ -1,7 +1,7 @@
 from time import perf_counter
 
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -18,14 +18,42 @@ class LLMEngine:
         self.config = Config(model, **config_kwargs)
         Sequence.block_size = self.config.kvcache_block_size
         self.model_runner = ModelRunner(self.config)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model, use_fast=True)
+        if getattr(self.config.hf_config, "model_type", None) == "minimind-v":
+            from nanovllm.multimodal.processor import MiniMindVProcessor
+
+            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                self.config.model,
+                local_files_only=True,
+            )
+            self.multimodal_processor = MiniMindVProcessor(
+                self.tokenizer,
+                self.config.vision_model,
+                self.config.hf_config,
+                self.config.max_num_images_per_prompt,
+            )
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model,
+                use_fast=True,
+            )
+            self.multimodal_processor = None
         self.config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(self.config)
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt, sampling_params: SamplingParams):
+        mm_features = []
+        if isinstance(prompt, dict):
+            multi_modal_data = prompt.get("multi_modal_data") or {}
+            images = multi_modal_data.get("image")
+            prompt = prompt.get("prompt")
+            if not isinstance(prompt, str):
+                raise TypeError("multimodal input requires a string 'prompt'")
+            if self.multimodal_processor is None:
+                raise ValueError("this model does not support multimodal inputs")
+            prompt, mm_features = self.multimodal_processor.process(prompt, images)
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        self.scheduler.add(Sequence(prompt, sampling_params))
+        self.scheduler.add(Sequence(prompt, sampling_params, mm_features))
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
@@ -48,7 +76,7 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str] | list[list[int]] | list[dict],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[dict]:

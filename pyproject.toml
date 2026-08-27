@@ -21,6 +21,7 @@ dependencies = [
     "flash-attn==2.8.3",
     "transformers>=4.51.0",
     "safetensors",
+    "Pillow",
     "tqdm",
     "xxhash",
 ]

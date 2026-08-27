@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import torch
 
 from nanovllm.config import Config
@@ -11,7 +13,7 @@ from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
-    """Builds the model on GPU (bf16), loads safetensors weights, and runs
+    """Builds the model on GPU (bf16), loads checkpoint weights, and runs
     batches of sequences with a minimal paged KV cache."""
 
     def __init__(self, config: Config):
@@ -25,9 +27,16 @@ class ModelRunner:
             config.quantization,
             config.quantization_group_size,
         )
-        self.model = model_cls(hf_config, quant_config=quant_config)
+        model_kwargs = {"quant_config": quant_config}
+        if getattr(hf_config, "model_type", None) == "minimind-v":
+            model_kwargs["vision_model_path"] = config.vision_model
+        self.model = model_cls(hf_config, **model_kwargs)
         load_model(self.model, config.model)
         self.model.eval()
+        self.encoder_cache = OrderedDict()
+        self.max_encoder_cache_items = (
+            config.max_num_seqs * config.max_num_images_per_prompt * 2
+        )
         self.sampler = Sampler()
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -41,6 +50,17 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        if getattr(getattr(self, "model", None), "supports_multimodal", False):
+            image_size = self.model.vision_encoder.config.image_size
+            dummy_pixels = torch.zeros(
+                self.config.max_num_images_per_prompt,
+                3,
+                image_size,
+                image_size,
+                dtype=torch.float32,
+            )
+            self.model.embed_multimodal(dummy_pixels)
+            del dummy_pixels
         max_num_batched_tokens = self.config.max_num_batched_tokens
         max_model_len = self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
@@ -119,9 +139,42 @@ class ModelRunner:
             pin_memory=True,
         ).cuda(non_blocking=True)
 
+    def _get_encoder_output(self, feature):
+        cached = self.encoder_cache.get(feature.identifier)
+        if cached is not None:
+            self.encoder_cache.move_to_end(feature.identifier)
+            return cached
+        output = self.model.embed_multimodal(
+            feature.pixel_values.cuda(non_blocking=True),
+        )[0].detach()
+        self.encoder_cache[feature.identifier] = output
+        self.encoder_cache.move_to_end(feature.identifier)
+        while len(self.encoder_cache) > self.max_encoder_cache_items:
+            self.encoder_cache.popitem(last=False)
+        return output
+
+    def _gather_multimodal_embeddings(self, seq, start: int, end: int):
+        embeddings = []
+        mask = [False] * (end - start)
+        for feature in seq.mm_features:
+            placeholder = feature.placeholder
+            if not placeholder.overlaps(start, end):
+                continue
+            overlap_start = max(start, placeholder.offset)
+            overlap_end = min(end, placeholder.offset + placeholder.length)
+            embed_start = overlap_start - placeholder.offset
+            embed_end = overlap_end - placeholder.offset
+            encoder_output = self._get_encoder_output(feature)
+            embeddings.append(encoder_output[embed_start:embed_end])
+            for i in range(overlap_start - start, overlap_end - start):
+                mask[i] = True
+        return embeddings, mask
+
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
+        multimodal_embeddings = []
+        is_multimodal = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
@@ -141,6 +194,13 @@ class ModelRunner:
                 )
             input_ids.extend(seq.token_ids[start:end])
             positions.extend(range(start, end))
+            chunk_embeddings, chunk_mask = self._gather_multimodal_embeddings(
+                seq,
+                start,
+                end,
+            )
+            multimodal_embeddings.extend(chunk_embeddings)
+            is_multimodal.extend(chunk_mask)
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(max_seqlen_q, seqlen_q)
@@ -171,6 +231,12 @@ class ModelRunner:
         slot_mapping = torch.tensor(
             slot_mapping, dtype=torch.int32, device="cpu", pin_memory=True,
         ).cuda(non_blocking=True)
+        is_multimodal = torch.tensor(
+            is_multimodal,
+            dtype=torch.bool,
+            device="cpu",
+            pin_memory=True,
+        ).cuda(non_blocking=True)
         set_context(
             True,
             slot_mapping=slot_mapping,
@@ -180,7 +246,7 @@ class ModelRunner:
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
         )
-        return input_ids, positions, cu_seqlens_q
+        return input_ids, positions, (multimodal_embeddings, is_multimodal)
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -241,7 +307,19 @@ class ModelRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         is_prefill: bool,
+        multimodal_embeddings=None,
+        is_multimodal=None,
     ) -> torch.Tensor:
+        if multimodal_embeddings:
+            # 合并，文字embd向量 + 图像embd向量替换
+            inputs_embeds = self.model.embed_input_ids(
+                input_ids,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+            return self.model.compute_logits(
+                self.model(None, positions, inputs_embeds=inputs_embeds),
+            )
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs[-1]:
             return self.model.compute_logits(self.model(input_ids, positions))
 
@@ -264,13 +342,22 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """Run one packed prefill or decode batch in a single model forward."""
         assert seqs, "seqs must not be empty"
+        multimodal_embeddings = None
+        is_multimodal = None
         if is_prefill:
-            input_ids, positions, _ = self.prepare_prefill(seqs)
+            input_ids, positions, multimodal_inputs = self.prepare_prefill(seqs)
+            multimodal_embeddings, is_multimodal = multimodal_inputs
         else:
             input_ids, positions = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs)
         try:
-            logits = self.run_model(input_ids, positions, is_prefill)
+            logits = self.run_model(
+                input_ids,
+                positions,
+                is_prefill,
+                multimodal_embeddings,
+                is_multimodal,
+            )
             token_ids = self.sampler(logits, temperatures).tolist()
         finally:
             reset_context()

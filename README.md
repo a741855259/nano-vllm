@@ -100,6 +100,40 @@ not quantize the KV cache.
 See `example.py` for a complete chat-template example and `bench.py` for the
 reference-compatible benchmark.
 
+## MiniMind-V
+
+MiniMind-V accepts vLLM-style multimodal request dictionaries. The vision
+tower is loaded separately because it is not included in the MiniMind-V
+language-model checkpoint.
+
+```python
+from PIL import Image
+from nanovllm import LLM, SamplingParams
+
+llm = LLM(
+    "/mnt/c/Downloads/minimind-3v",
+    vision_model="/mnt/c/Downloads/siglip2-base-p32-256-ve",
+)
+prompt = llm.tokenizer.apply_chat_template(
+    [{"role": "user", "content": "<image>\nDescribe this image."}],
+    tokenize=False,
+    add_generation_prompt=True,
+    open_thinking=False,
+)
+outputs = llm.generate(
+    [{
+        "prompt": prompt,
+        "multi_modal_data": {"image": Image.open("image.jpg").convert("RGB")},
+    }],
+    SamplingParams(temperature=0.0, max_tokens=256),
+)
+```
+
+The input processor expands each `<image>` marker into 64 image placeholder
+tokens. Vision encoder outputs are cached by image content, sliced correctly
+across chunked prefill boundaries, and included in prefix-cache block hashes.
+See `minimind_v_example.py` for a runnable local example.
+
 ## License
 
 MIT. See `LICENSE`.
