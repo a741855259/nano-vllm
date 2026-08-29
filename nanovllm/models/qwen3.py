@@ -120,6 +120,20 @@ class Qwen3DecoderLayer(nn.Module):
     def get_attention_bias(config) -> bool:
         return getattr(config, "attention_bias", True)
 
+    @staticmethod
+    def build_mlp(
+        config,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> nn.Module:
+        return Qwen3MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
     def __init__(self, config: Qwen3Config,
                  quant_config: QuantizationConfig | None = None,
                  prefix: str = ""):
@@ -140,11 +154,9 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=_add_prefix(prefix, "self_attn"),
         )
-        self.mlp = Qwen3MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
+        self.mlp = self.build_mlp(
+            config,
+            quant_config,
             prefix=_add_prefix(prefix, "mlp"),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

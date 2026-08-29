@@ -134,6 +134,20 @@ tokens. Vision encoder outputs are cached by image content, sliced correctly
 across chunked prefill boundaries, and included in prefix-cache block hashes.
 See `minimind_v_example.py` for a runnable local example.
 
+MiniMind-V MoE checkpoints using the same architecture are supported without
+configuration changes. For BF16/FP16, expert weights are packed as vLLM-style
+`w13` and `w2` tensors. Prefill groups tokens by selected expert, while Top-1
+decode uses a Triton routed-GEMM path that only reads the selected expert and is
+compatible with CUDA Graph capture. Online INT4 uses the existing per-expert
+linear fallback; the router remains in the model dtype.
+
+```python
+llm = LLM(
+    "/mnt/c/Downloads/minimind-3v-moe",
+    vision_model="/mnt/c/Downloads/siglip2-base-p32-256-ve",
+)
+```
+
 ## License
 
 MIT. See `LICENSE`.

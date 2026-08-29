@@ -38,6 +38,25 @@ def load_model(model: nn.Module, path: str):
     gate/up -> gate_up_proj via packed_modules_mapping (same scheme as nano-vllm)."""
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for weight_name, loaded_weight in iter_weights(path):
+        parts = weight_name.split(".")
+        if len(parts) >= 5 and parts[-4] == "experts":
+            try:
+                expert_id = int(parts[-3])
+            except ValueError:
+                expert_id = -1
+            projection = parts[-2]
+            experts_name = ".".join(parts[:-3])
+            if expert_id >= 0 and projection in {
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            }:
+                experts = model.get_submodule(experts_name)
+                expert_loader = getattr(experts, "load_expert_weight", None)
+                # 按专家ID逐步加载到同一个packed专家权重矩阵
+                if expert_loader is not None:
+                    expert_loader(expert_id, projection, loaded_weight)
+                    continue
         for source_name, (target_name, shard_id) in packed_modules_mapping.items():
             if source_name in weight_name:
                 param_name = weight_name.replace(source_name, target_name)

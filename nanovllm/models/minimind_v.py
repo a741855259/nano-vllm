@@ -5,15 +5,153 @@ from torch import nn
 from transformers import SiglipVisionModel
 
 from nanovllm.layers.embed_head import ParallelLMHead
+from nanovllm.layers.fused_moe import FusedExperts
+from nanovllm.layers.linear import ColumnParallelLinear
 from nanovllm.layers.quantization import QuantizationConfig
 from nanovllm.models.qwen3 import (
     Qwen3DecoderLayer,
+    Qwen3MLP,
     Qwen3Model,
     _add_prefix,
 )
+from nanovllm.utils.context import get_context
+
+
+class UnfusedExperts(nn.ModuleList):
+
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ):
+        super().__init__([
+            Qwen3MLP(
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.hidden_act,
+                quant_config,
+                prefix=_add_prefix(prefix, f"experts.{expert_id}"),
+            )
+            for expert_id in range(config.num_experts)
+        ])
+
+    def _forward_prefill(
+        self,
+        x: torch.Tensor,
+        routed_weights: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        output = torch.zeros_like(x)
+        for expert_id, expert in enumerate(self):
+            token_ids, topk_ids = torch.where(expert_ids == expert_id)
+            if token_ids.numel() == 0:
+                continue
+            expert_output = expert(x[token_ids])
+            expert_weight = routed_weights[token_ids, topk_ids, None].to(x.dtype)
+            # index_add_ writes experts back in token order and reduces Top-K.
+            output.index_add_(0, token_ids, expert_output * expert_weight)
+        return output
+
+    def _forward_decode(
+        self,
+        x: torch.Tensor,
+        routed_weights: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # Static shapes keep the fallback compatible with CUDA Graph capture.
+        output = torch.zeros_like(x)
+        for expert_id, expert in enumerate(self):
+            expert_weight = (
+                routed_weights * (expert_ids == expert_id)
+            ).sum(dim=-1, keepdim=True)
+            output.add_(expert(x) * expert_weight.to(x.dtype))
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        routed_weights: torch.Tensor,
+        expert_ids: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        if is_prefill:
+            return self._forward_prefill(x, routed_weights, expert_ids)
+        return self._forward_decode(x, routed_weights, expert_ids)
+
+
+class MiniMindMoE(nn.Module):
+
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.renormalize = config.norm_topk_prob
+        if not 0 < self.top_k <= config.num_experts:
+            raise ValueError(
+                "num_experts_per_tok must be between 1 and num_experts"
+            )
+
+        # Routers stay in the model dtype even when experts are quantized.
+        self.gate = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=_add_prefix(prefix, "gate"),
+        )
+        if quant_config is None and self.top_k == 1:
+            self.experts = FusedExperts(
+                config.num_experts,
+                config.hidden_size,
+                config.moe_intermediate_size,
+            )
+        else:
+            self.experts = UnfusedExperts(config, quant_config, prefix)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+        x = x.reshape(-1, original_shape[-1])
+        scores = torch.softmax(self.gate(x), dim=-1)
+        # Top-K is token-local, so independently packed requests do not mix.
+        routed_weights, expert_ids = torch.topk(
+            scores,
+            self.top_k,
+            dim=-1,
+            sorted=False,
+        )
+        if self.renormalize:
+            routed_weights = routed_weights / (
+                routed_weights.sum(dim=-1, keepdim=True) + 1e-20
+            )
+        output = self.experts(
+            x,
+            routed_weights,
+            expert_ids,
+            is_prefill=get_context().is_prefill,
+        )
+        return output.reshape(original_shape)
 
 
 class MiniMindDecoderLayer(Qwen3DecoderLayer):
+
+    @staticmethod
+    def build_mlp(
+        config,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> nn.Module:
+        if getattr(config, "use_moe", False):
+            return MiniMindMoE(
+                config,
+                quant_config,
+                prefix=prefix,
+            )
+        return Qwen3DecoderLayer.build_mlp(config, quant_config, prefix)
 
     @staticmethod
     def get_attention_bias(config) -> bool:
@@ -30,8 +168,6 @@ class MiniMindModel(Qwen3Model):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
-        if getattr(config, "use_moe", False):
-            raise NotImplementedError("MiniMind MoE checkpoints are not supported")
         super().__init__(config, quant_config, prefix)
 
 
