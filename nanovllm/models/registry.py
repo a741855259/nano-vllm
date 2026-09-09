@@ -4,6 +4,10 @@ from torch import nn
 
 
 _MODELS = {
+    "MiniMindOmni": (
+        "nanovllm.models.minimind_o",
+        "MiniMindOmniThinker",
+    ),
     "MiniMindVLM": (
         "nanovllm.models.minimind_v",
         "MiniMindVLM",

@@ -18,19 +18,36 @@ class LLMEngine:
         self.config = Config(model, **config_kwargs)
         Sequence.block_size = self.config.kvcache_block_size
         self.model_runner = ModelRunner(self.config)
-        if getattr(self.config.hf_config, "model_type", None) == "minimind-v":
-            from nanovllm.multimodal.processor import MiniMindVProcessor
+        model_type = getattr(self.config.hf_config, "model_type", None)
+        if model_type in {"minimind-v", "minimind-o"}:
 
             self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
                 self.config.model,
                 local_files_only=True,
             )
-            self.multimodal_processor = MiniMindVProcessor(
-                self.tokenizer,
-                self.config.vision_model,
-                self.config.hf_config,
-                self.config.max_num_images_per_prompt,
-            )
+            if model_type == "minimind-o":
+                from nanovllm.multimodal.minimind_o_processor import (
+                    MiniMindOProcessor,
+                )
+
+                self.multimodal_processor = MiniMindOProcessor(
+                    self.tokenizer,
+                    self.config.vision_model,
+                    self.config.hf_config,
+                    self.model_runner.model.audio_processor,
+                    self.config.max_num_images_per_prompt,
+                    self.config.max_num_audios_per_prompt,
+                    self.config.max_audio_feature_tokens,
+                )
+            else:
+                from nanovllm.multimodal.processor import MiniMindVProcessor
+                
+                self.multimodal_processor = MiniMindVProcessor(
+                    self.tokenizer,
+                    self.config.vision_model,
+                    self.config.hf_config,
+                    self.config.max_num_images_per_prompt,
+                )
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model,
@@ -43,14 +60,17 @@ class LLMEngine:
     def add_request(self, prompt, sampling_params: SamplingParams):
         mm_features = []
         if isinstance(prompt, dict):
-            multi_modal_data = prompt.get("multi_modal_data") or {}
-            images = multi_modal_data.get("image")
+            multi_modal_data = prompt.get("multi_modal_data")
+            if multi_modal_data is None:
+                multi_modal_data = {}
             prompt = prompt.get("prompt")
             if not isinstance(prompt, str):
                 raise TypeError("multimodal input requires a string 'prompt'")
             if self.multimodal_processor is None:
                 raise ValueError("this model does not support multimodal inputs")
-            prompt, mm_features = self.multimodal_processor.process(prompt, images)
+            prompt, mm_features = self.multimodal_processor.process_request(
+                prompt, multi_modal_data,
+            )
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         self.scheduler.add(Sequence(prompt, sampling_params, mm_features))

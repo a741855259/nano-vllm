@@ -18,7 +18,10 @@ class Config:
     gpu_memory_utilization: float = 0.9
     enforce_eager: bool = False
     vision_model: str | None = None
+    audio_model: str | None = None
     max_num_images_per_prompt: int = 1
+    max_num_audios_per_prompt: int = 1
+    max_audio_feature_tokens: int = 1200
     quantization: str | None = None
     quantization_group_size: int = 128
     kvcache_block_size: int = 256
@@ -31,6 +34,8 @@ class Config:
         assert self.max_num_batched_tokens > 0
         assert self.max_num_seqs > 0
         assert self.max_num_images_per_prompt > 0
+        assert self.max_num_audios_per_prompt > 0
+        assert self.max_audio_feature_tokens > 0
         if self.quantization not in (None, "int4"):
             raise ValueError(
                 f"unsupported quantization {self.quantization!r}; "
@@ -45,9 +50,15 @@ class Config:
             "kvcache_block_size must be a multiple of 256 for paged FlashAttention"
         )
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        if getattr(self.hf_config, "model_type", None) == "minimind-v":
+        model_type = getattr(self.hf_config, "model_type", None)
+        if model_type in {"minimind-v", "minimind-o"}:
             if not self.vision_model or not os.path.isdir(self.vision_model):
                 raise ValueError(
-                    "MiniMindVLM requires a local vision_model directory"
+                    f"{model_type} requires a local vision_model directory"
+                )
+        if model_type == "minimind-o":
+            if not self.audio_model or not os.path.isdir(self.audio_model):
+                raise ValueError(
+                    "minimind-o requires a local audio_model directory"
                 )
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

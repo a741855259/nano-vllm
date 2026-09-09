@@ -148,6 +148,50 @@ llm = LLM(
 )
 ```
 
+## MiniMind-O Thinker
+
+The first-stage MiniMind-O integration supports text, image, and audio inputs
+with text generation. The language-model checkpoint contains the trainable
+Thinker, projectors, and Talker weights, while the frozen SigLIP2 and
+SenseVoice models are loaded from separate local directories. Talker inference
+and Mimi waveform generation are intentionally left for the second stage.
+
+Install the optional audio dependencies:
+
+```bash
+uv sync --extra omni
+```
+
+Expected local model layout:
+
+```text
+/mnt/c/Downloads/
+├── minimind-3o/
+├── siglip2-base-p32-256-ve/
+└── SenseVoiceSmall/
+```
+
+Create the engine with both external encoders:
+
+```python
+llm = LLM(
+    "/mnt/c/Downloads/minimind-3o",
+    vision_model="/mnt/c/Downloads/siglip2-base-p32-256-ve",
+    audio_model="/mnt/c/Downloads/SenseVoiceSmall",
+    enforce_eager=True,
+)
+```
+
+Multimodal prompts use one `<image>` marker per image and one `<audio>` marker
+per audio item. The processor expands image markers to 64 SigLIP2 tokens and
+audio markers to the number of valid SenseVoice feature frames. Both modality
+outputs use the same encoder cache, chunked-prefill slicing, and prefix-cache
+media identity mechanism as MiniMind-V.
+
+See `minimind_o_example.py` for a mixed audio-and-image request. This stage
+returns only `text` and `token_ids`; it does not return Mimi audio codes or a
+waveform.
+
 ## License
 
 MIT. See `LICENSE`.

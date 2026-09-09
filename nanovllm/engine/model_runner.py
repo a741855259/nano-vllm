@@ -28,14 +28,22 @@ class ModelRunner:
             config.quantization_group_size,
         )
         model_kwargs = {"quant_config": quant_config}
-        if getattr(hf_config, "model_type", None) == "minimind-v":
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type in {"minimind-v", "minimind-o"}:
             model_kwargs["vision_model_path"] = config.vision_model
+        if model_type == "minimind-o":
+            model_kwargs["audio_model_path"] = config.audio_model
         self.model = model_cls(hf_config, **model_kwargs)
         load_model(self.model, config.model)
         self.model.eval()
         self.encoder_cache = OrderedDict()
         self.max_encoder_cache_items = (
-            config.max_num_seqs * config.max_num_images_per_prompt * 2
+            config.max_num_seqs
+            * (
+                config.max_num_images_per_prompt
+                + config.max_num_audios_per_prompt
+            )
+            * 2
         )
         self.sampler = Sampler()
         self.block_size = config.kvcache_block_size
@@ -50,7 +58,7 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        if getattr(getattr(self, "model", None), "supports_multimodal", False):
+        if hasattr(getattr(self, "model", None), "vision_encoder"):
             image_size = self.model.vision_encoder.config.image_size
             dummy_pixels = torch.zeros(
                 self.config.max_num_images_per_prompt,
@@ -59,8 +67,34 @@ class ModelRunner:
                 image_size,
                 dtype=torch.float32,
             )
-            self.model.embed_multimodal(dummy_pixels)
+            self.model.embed_multimodal(
+                modality="image",
+                pixel_values=dummy_pixels,
+            )
             del dummy_pixels
+        if hasattr(getattr(self, "model", None), "audio_encoder"):
+            audio_feature_tokens = min(
+                self.config.max_audio_feature_tokens,
+                self.config.max_num_batched_tokens,
+                self.config.max_model_len,
+            )
+            dummy_features = torch.zeros(
+                self.config.max_num_audios_per_prompt,
+                audio_feature_tokens,
+                560,
+                dtype=torch.float32,
+            )
+            dummy_lengths = torch.full(
+                (self.config.max_num_audios_per_prompt,),
+                audio_feature_tokens,
+                dtype=torch.long,
+            )
+            self.model.embed_multimodal(
+                modality="audio",
+                input_features=dummy_features,
+                feature_lengths=dummy_lengths,
+            )
+            del dummy_features, dummy_lengths
         max_num_batched_tokens = self.config.max_num_batched_tokens
         max_model_len = self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
@@ -144,8 +178,13 @@ class ModelRunner:
         if cached is not None:
             self.encoder_cache.move_to_end(feature.identifier)
             return cached
+        data = {
+            key: value.cuda(non_blocking=True)
+            for key, value in feature.data.items()
+        }
         output = self.model.embed_multimodal(
-            feature.pixel_values.cuda(non_blocking=True),
+            modality=feature.modality,
+            **data,
         )[0].detach()
         self.encoder_cache[feature.identifier] = output
         self.encoder_cache.move_to_end(feature.identifier)

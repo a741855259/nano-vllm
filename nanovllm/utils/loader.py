@@ -37,7 +37,10 @@ def load_model(model: nn.Module, path: str):
     """Load checkpoint weights into the model, fusing q/k/v -> qkv_proj and
     gate/up -> gate_up_proj via packed_modules_mapping (same scheme as nano-vllm)."""
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    ignored_weight_prefixes = getattr(model, "ignored_weight_prefixes", ())
     for weight_name, loaded_weight in iter_weights(path):
+        if weight_name.startswith(ignored_weight_prefixes):
+            continue
         parts = weight_name.split(".")
         if len(parts) >= 5 and parts[-4] == "experts":
             try:

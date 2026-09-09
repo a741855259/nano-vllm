@@ -15,9 +15,12 @@ class PlaceholderRange:
 
 @dataclass
 class MultiModalFeature:
-    # 图片内容 hash，用于 encoder cache 和 Prefix Cache
+    # 媒体内容 hash，用于 encoder cache 和 Prefix Cache
     identifier: str
-    # SigLIP processor 处理后的 [1, 3, 256, 256]
-    pixel_values: torch.Tensor
-    # 该图片对应的 64 个 token 在 prompt 中的位置
     placeholder: PlaceholderRange
+    data: dict[str, torch.Tensor]
+    modality: str = "image"
+
+    def __post_init__(self):
+        if not self.data:
+            raise ValueError("multimodal feature data cannot be empty")

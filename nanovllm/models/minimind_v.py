@@ -237,7 +237,16 @@ class MiniMindVLM(nn.Module):
     # 1.图片先经过ImageProcessor(SiglipImageProcessor)得到mm_features图片像素pixel_values(float32)
     # 2.再输入VisionEncoder(SiglipVisionModel)得到hidden_states 视觉模型输出(float16)
     # 3.再经过MMVisionProjector投影映射到语音Embd空间, 作为主LLM的Vision EmbdToken(bfloat16)
-    def embed_multimodal(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def embed_multimodal(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        modality: str = "image",
+        **data,
+    ) -> torch.Tensor:
+        if modality != "image":
+            raise ValueError(f"unsupported MiniMind-V modality: {modality}")
+        if pixel_values is None:
+            pixel_values = data["pixel_values"]
         vision_dtype = next(self.vision_encoder.parameters()).dtype  # float16
         outputs = self.vision_encoder(pixel_values=pixel_values.to(vision_dtype))
         features = outputs.last_hidden_state
